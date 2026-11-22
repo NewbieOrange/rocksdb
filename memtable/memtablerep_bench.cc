@@ -60,6 +60,7 @@ DEFINE_string(memtablerep, "skiplist",
               "include/memtablerep.h for\n"
               "  more details. Options:\n"
               "\tskiplist            -- backed by a skiplist\n"
+              "\tbskip_list          -- backed by a B-skiplist\n"
               "\tvector              -- backed by an std::vector\n"
               "\thashskiplist        -- backed by a hash skip list\n"
               "\thashlinklist        -- backed by a hash linked list\n"

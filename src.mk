@@ -147,6 +147,7 @@ LIB_SOURCES =                                                   \
   memory/memkind_kmem_allocator.cc                              \
   memory/memory_allocator.cc                                    \
   memtable/alloc_tracker.cc                                     \
+  memtable/bskiplistrep.cc                                      \
   memtable/hash_linklist_rep.cc                                 \
   memtable/hash_skiplist_rep.cc                                 \
   memtable/skiplistrep.cc                                       \
@@ -611,6 +612,7 @@ TEST_MAIN_SOURCES =                                                     \
   logging/event_logger_test.cc                                          \
   memory/arena_test.cc                                                  \
   memory/memory_allocator_test.cc                                       \
+  memtable/bskiplist_test.cc                                            \
   memtable/inlineskiplist_test.cc                                       \
   memtable/skiplist_test.cc                                             \
   memtable/write_buffer_manager_test.cc                                 \

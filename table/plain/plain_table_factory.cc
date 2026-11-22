@@ -179,6 +179,13 @@ static int RegisterBuiltinMemTableRepFactory(ObjectLibrary& library,
         return guard->get();
       });
   library.AddFactory<MemTableRepFactory>(
+      AsPattern(BSkipListFactory::kClassName(), BSkipListFactory::kNickName()),
+      [](const std::string& /*uri*/, std::unique_ptr<MemTableRepFactory>* guard,
+         std::string* /*errmsg*/) {
+        guard->reset(new BSkipListFactory());
+        return guard->get();
+      });
+  library.AddFactory<MemTableRepFactory>(
       AsPattern(SkipListFactory::kClassName(), SkipListFactory::kNickName()),
       [](const std::string& uri, std::unique_ptr<MemTableRepFactory>* guard,
          std::string* /*errmsg*/) {

@@ -158,6 +158,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "memory/memkind_kmem_allocator.cc",
         "memory/memory_allocator.cc",
         "memtable/alloc_tracker.cc",
+        "memtable/bskiplistrep.cc",
         "memtable/hash_linklist_rep.cc",
         "memtable/hash_skiplist_rep.cc",
         "memtable/skiplistrep.cc",
@@ -4675,6 +4676,12 @@ cpp_unittest_wrapper(name="block_test",
 
 cpp_unittest_wrapper(name="bloom_test",
             srcs=["util/bloom_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="bskiplist_test",
+            srcs=["memtable/bskiplist_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

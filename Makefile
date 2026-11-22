@@ -2031,6 +2031,9 @@ data_block_hash_index_test: $(OBJ_DIR)/table/block_based/data_block_hash_index_t
 inlineskiplist_test: $(OBJ_DIR)/memtable/inlineskiplist_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+bskiplist_test: $(OBJ_DIR)/memtable/bskiplist_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 skiplist_test: $(OBJ_DIR)/memtable/skiplist_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
