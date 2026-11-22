@@ -194,6 +194,10 @@ TEST_F(BSkipListTest, SeekBeforeAndAfter) {
   Insert(&list_, "d", 1);
   Insert(&list_, "f", 1);
   BSkipList::Iterator iter(&list_);
+  const std::string first = Encode("b", 1);
+  iter.Seek(first.data());
+  ASSERT_TRUE(iter.Valid());
+  ASSERT_EQ(Decode(iter.key()).first, "b");
   const std::string before = Encode("a", 1);
   iter.Seek(before.data());
   ASSERT_EQ(Decode(iter.key()).first, "b");
