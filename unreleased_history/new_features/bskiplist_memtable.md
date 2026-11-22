@@ -1,1 +1,1 @@
-Add a `bskip_list` memtable (`BSkipListFactory`). It requires the default bytewise comparator and keeps short user keys inside the node so point lookups and scans compare without chasing the entry. Concurrent inserts into different nodes run together.
+Add a `bskip_list` memtable (`BSkipListFactory`). It requires the default bytewise comparator and keeps the first 48 bytes of each user key inside the node so point lookups and scans compare without chasing the entry. Concurrent inserts into different nodes run together.

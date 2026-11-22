@@ -447,8 +447,8 @@ class SkipListFactory : public MemTableRepFactory {
 };
 
 // Memtable backed by a B-skiplist (a skip list whose nodes hold many sorted
-// keys). User keys of up to 16 bytes and the internal-key footer are stored
-// in the node, so bytewise comparisons do not chase the memtable entry.
+// keys). The first 48 bytes of the user key and the internal-key footer are
+// stored in the node, so those comparisons do not chase the memtable entry.
 //
 // Readers do not take locks. Insert() must be externally synchronized.
 // InsertConcurrently() claims each node it modifies with a compare-and-swap
@@ -457,8 +457,8 @@ class SkipListFactory : public MemTableRepFactory {
 //
 // Only the default bytewise comparator is supported. Open, CreateColumnFamily,
 // and SetOptions fail with Status::NotSupported for any other comparator.
-// User keys longer than 16 bytes are correct; those comparisons read the
-// full user key.
+// User keys longer than 48 bytes are correct; the bytes past that are read
+// from the memtable entry.
 //
 // Also available as "bskip_list".
 class BSkipListFactory : public MemTableRepFactory {

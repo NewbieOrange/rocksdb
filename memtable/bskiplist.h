@@ -49,7 +49,12 @@ class BSkipList {
 
  public:
   static constexpr uint32_t kFanout = 16;
+  // Bytes compared as integers before a search reads the memtable entry.
+  // The first 16 are the common case. The next 32 cover keys that share a
+  // long prefix; those used to miss into the arena and memcmp the whole key.
   static constexpr uint32_t kInlineUserKey = 16;
+  static constexpr uint32_t kExtraWords = 4;
+  static constexpr uint32_t kPrefixBytes = kInlineUserKey + kExtraWords * 8;
   static constexpr int kMaxHeight = 8;
   static constexpr uint32_t kBranch = 16;
 
@@ -123,10 +128,12 @@ class BSkipList {
     const char* user;
     uint32_t user_len;
     uint64_t footer;
-    // First 16 user-key bytes, zero-padded, byte-swapped on little endian so
-    // an integer compare matches memcmp.
+    // User-key bytes in memcmp order, zero-padded, byte-swapped on little
+    // endian so an integer compare matches memcmp. `word0`/`word1` are the
+    // first 16 bytes. `extra` is bytes [16, 48).
     uint64_t word0;
     uint64_t word1;
+    uint64_t extra[kExtraWords];
   };
 
   struct SlotView {
@@ -135,6 +142,7 @@ class BSkipList {
     uint64_t footer;
     uint64_t word0;
     uint64_t word1;
+    uint64_t extra[kExtraWords];
     char user[kInlineUserKey];
   };
 
@@ -159,7 +167,14 @@ class BSkipList {
     std::atomic<uint64_t> next_footer;
     std::atomic<uint64_t> next_word0;
     std::atomic<uint64_t> next_word1;
+    // Slots stay here, at the same offset as a node without the long-key
+    // prefix, so the word0 scan stays cache-line aligned.
     Slot slots[kFanout];
+    std::atomic<uint64_t> next_extra[kExtraWords];
+    // Bytes [16, 48) of each slot, `kFanout * kExtraWords` words. Null when
+    // every key in the node is at most 16 bytes, so short-key nodes stay the
+    // same size and the word0 scan keeps its stride.
+    std::atomic<uint64_t>* extra;
     // Immutable after the node is published. Null on leaves. Elements are
     // mutated only inside the seqlock.
     std::atomic<Node*>* children;
@@ -174,7 +189,12 @@ class BSkipList {
           next_footer(0),
           next_word0(0),
           next_word1(0),
-          children(nullptr) {}
+          extra(nullptr),
+          children(nullptr) {
+      for (uint32_t i = 0; i < kExtraWords; ++i) {
+        next_extra[i].store(0, std::memory_order_relaxed);
+      }
+    }
   };
 
   static_assert(sizeof(Node) % alignof(std::atomic<Node*>) == 0,
@@ -197,6 +217,8 @@ class BSkipList {
   static KeyView ParseInternalKey(const Slice& ikey);
   static void PackUserWords(const char* user, uint32_t user_len, uint64_t* word0,
                             uint64_t* word1);
+  static uint64_t PackWordAt(const char* user, uint32_t user_len, uint32_t off);
+  static void PackExtra(const char* user, uint32_t user_len, uint64_t* extra);
   static void StoreUserWords(std::atomic<uint64_t>* word0,
                              std::atomic<uint64_t>* word1, const char* user,
                              uint32_t user_len);
@@ -206,16 +228,24 @@ class BSkipList {
 
   Node* NewNode(uint32_t level);
   void WriteSentinel(Node* node);
-  void WriteSlot(Slot* dst, const KeyView& key) const;
-  void WriteSlot(Slot* dst, const SlotView& src) const;
-  void CopySlot(Slot* dst, const Slot& src) const;
-  SlotView ReadSlot(const Slot& src) const;
+  void EnsureExtra(Node* node) const;
+  void WriteSlot(Node* node, uint32_t index, const KeyView& key) const;
+  void WriteSlot(Node* node, uint32_t index, const SlotView& src) const;
+  void CopySlot(Node* dst, uint32_t dst_index, const Node* src,
+                uint32_t src_index) const;
+  SlotView ReadSlot(const Node* node, uint32_t index) const;
   int CompareFull(const char* a, uint32_t a_len, uint64_t a_foot, const char* b,
                   uint32_t b_len, uint64_t b_foot) const;
+  // REQUIRES: the first kPrefixBytes user-key bytes already compared equal.
+  int CompareSuffix(const char* a, uint32_t a_len, uint64_t a_foot, const char* b,
+                    uint32_t b_len, uint64_t b_foot) const;
+  // REQUIRES: word0 and word1 already compared equal.
+  int CmpPastInline(const KeyView& key, const uint64_t* extra, uint32_t other_len,
+                    uint64_t other_foot, const char* other_user) const;
   const char* FullUser(const SlotView& slot) const;
   int CompareKeyToSlot(const KeyView& key, const SlotView& slot) const;
   int CompareKeyToNextHeader(const KeyView& key, const Node* node) const;
-  void StoreNextHeader(Node* node, const Slot& slot0);
+  void StoreNextHeader(Node* node, const Node* next_node);
   uint32_t FindRank(const Node* node, uint32_t count, const KeyView& key,
                     SlotView* at) const;
   Node* WalkRight(Node* node, const KeyView& key) const;
@@ -274,6 +304,32 @@ inline void BSkipList::PackUserWords(const char* user, uint32_t user_len,
   *word1 = second;
 }
 
+inline uint64_t BSkipList::PackWordAt(const char* user, uint32_t user_len,
+                                      uint32_t off) {
+  uint64_t word = 0;
+  if (user_len > off) {
+    const uint32_t n = user_len - off < 8 ? user_len - off : 8;
+    memcpy(&word, user + off, n);
+    if (port::kLittleEndian) {
+      word = EndianSwapValue(word);
+    }
+  }
+  return word;
+}
+
+inline void BSkipList::PackExtra(const char* user, uint32_t user_len,
+                                 uint64_t* extra) {
+  if (user_len <= kInlineUserKey) {
+    for (uint32_t t = 0; t < kExtraWords; ++t) {
+      extra[t] = 0;
+    }
+    return;
+  }
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    extra[t] = PackWordAt(user, user_len, kInlineUserKey + t * 8);
+  }
+}
+
 inline BSkipList::KeyView BSkipList::ParseEntry(const char* entry) {
   Slice ikey = GetLengthPrefixedSlice(entry);
   assert(ikey.size() >= 8);
@@ -283,6 +339,7 @@ inline BSkipList::KeyView BSkipList::ParseEntry(const char* entry) {
   view.user_len = static_cast<uint32_t>(ikey.size() - 8);
   view.footer = DecodeFixed64(ikey.data() + view.user_len);
   PackUserWords(view.user, view.user_len, &view.word0, &view.word1);
+  PackExtra(view.user, view.user_len, view.extra);
   return view;
 }
 
@@ -294,6 +351,7 @@ inline BSkipList::KeyView BSkipList::ParseInternalKey(const Slice& ikey) {
   view.user_len = static_cast<uint32_t>(ikey.size() - 8);
   view.footer = DecodeFixed64(ikey.data() + view.user_len);
   PackUserWords(view.user, view.user_len, &view.word0, &view.word1);
+  PackExtra(view.user, view.user_len, view.extra);
   return view;
 }
 
@@ -387,41 +445,99 @@ inline void BSkipList::WriteSentinel(Node* node) {
   node->count.store(1, std::memory_order_relaxed);
 }
 
-inline void BSkipList::WriteSlot(Slot* dst, const KeyView& key) const {
+inline void BSkipList::EnsureExtra(Node* node) const {
+  if (node->extra != nullptr) {
+    return;
+  }
+  const size_t n = static_cast<size_t>(kFanout) * kExtraWords;
+  char* raw = allocator_->AllocateAligned(n * sizeof(std::atomic<uint64_t>));
+  std::atomic<uint64_t>* words =
+      static_cast<std::atomic<uint64_t>*>(static_cast<void*>(raw));
+  for (size_t i = 0; i < n; ++i) {
+    new (words + i) std::atomic<uint64_t>(0);
+  }
+  node->extra = words;
+}
+
+inline void BSkipList::WriteSlot(Node* node, uint32_t index,
+                                 const KeyView& key) const {
+  Slot* dst = &node->slots[index];
   dst->entry.store(key.entry, std::memory_order_relaxed);
   dst->footer.store(key.footer, std::memory_order_relaxed);
   dst->user_len.store(key.user_len, std::memory_order_relaxed);
   StoreUserWords(&dst->word0, &dst->word1, key.user, key.user_len);
+  if (key.user_len <= kInlineUserKey && node->extra == nullptr) {
+    return;
+  }
+  EnsureExtra(node);
+  std::atomic<uint64_t>* row = node->extra + index * kExtraWords;
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    row[t].store(key.extra[t], std::memory_order_relaxed);
+  }
 }
 
-inline void BSkipList::WriteSlot(Slot* dst, const SlotView& src) const {
+inline void BSkipList::WriteSlot(Node* node, uint32_t index,
+                                 const SlotView& src) const {
+  Slot* dst = &node->slots[index];
   dst->word0.store(src.word0, std::memory_order_relaxed);
   dst->word1.store(src.word1, std::memory_order_relaxed);
   dst->footer.store(src.footer, std::memory_order_relaxed);
   dst->user_len.store(src.user_len, std::memory_order_relaxed);
   dst->entry.store(src.entry, std::memory_order_relaxed);
+  if (src.user_len <= kInlineUserKey && node->extra == nullptr) {
+    return;
+  }
+  EnsureExtra(node);
+  std::atomic<uint64_t>* row = node->extra + index * kExtraWords;
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    row[t].store(src.extra[t], std::memory_order_relaxed);
+  }
 }
 
-inline void BSkipList::CopySlot(Slot* dst, const Slot& src) const {
-  dst->entry.store(src.entry.load(std::memory_order_relaxed),
+inline void BSkipList::CopySlot(Node* dst, uint32_t dst_index, const Node* src,
+                                uint32_t src_index) const {
+  const Slot& from = src->slots[src_index];
+  Slot* to = &dst->slots[dst_index];
+  to->entry.store(from.entry.load(std::memory_order_relaxed),
+                  std::memory_order_relaxed);
+  to->footer.store(from.footer.load(std::memory_order_relaxed),
                    std::memory_order_relaxed);
-  dst->footer.store(src.footer.load(std::memory_order_relaxed),
+  to->user_len.store(from.user_len.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+  to->word0.store(from.word0.load(std::memory_order_relaxed),
+                  std::memory_order_relaxed);
+  to->word1.store(from.word1.load(std::memory_order_relaxed),
+                  std::memory_order_relaxed);
+  if (src->extra == nullptr) {
+    return;
+  }
+  EnsureExtra(dst);
+  const std::atomic<uint64_t>* from_row = src->extra + src_index * kExtraWords;
+  std::atomic<uint64_t>* to_row = dst->extra + dst_index * kExtraWords;
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    to_row[t].store(from_row[t].load(std::memory_order_relaxed),
                     std::memory_order_relaxed);
-  dst->user_len.store(src.user_len.load(std::memory_order_relaxed),
-                      std::memory_order_relaxed);
-  dst->word0.store(src.word0.load(std::memory_order_relaxed),
-                   std::memory_order_relaxed);
-  dst->word1.store(src.word1.load(std::memory_order_relaxed),
-                   std::memory_order_relaxed);
+  }
 }
 
-inline BSkipList::SlotView BSkipList::ReadSlot(const Slot& src) const {
+inline BSkipList::SlotView BSkipList::ReadSlot(const Node* node,
+                                               uint32_t index) const {
+  const Slot& src = node->slots[index];
   SlotView view;
   view.word0 = src.word0.load(std::memory_order_relaxed);
   view.word1 = src.word1.load(std::memory_order_relaxed);
   view.footer = src.footer.load(std::memory_order_relaxed);
   view.user_len = src.user_len.load(std::memory_order_relaxed);
   view.entry = src.entry.load(std::memory_order_relaxed);
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    view.extra[t] = 0;
+  }
+  if (node->extra != nullptr) {
+    const std::atomic<uint64_t>* row = node->extra + index * kExtraWords;
+    for (uint32_t t = 0; t < kExtraWords; ++t) {
+      view.extra[t] = row[t].load(std::memory_order_relaxed);
+    }
+  }
   LoadUserWords(view.word0, view.word1, view.user);
   return view;
 }
@@ -452,6 +568,49 @@ inline int BSkipList::CompareFull(const char* a, uint32_t a_len,
   return 0;
 }
 
+inline int BSkipList::CompareSuffix(const char* a, uint32_t a_len,
+                                    uint64_t a_foot, const char* b,
+                                    uint32_t b_len, uint64_t b_foot) const {
+  const uint32_t a_from = a_len > kPrefixBytes ? kPrefixBytes : a_len;
+  const uint32_t b_from = b_len > kPrefixBytes ? kPrefixBytes : b_len;
+  const uint32_t a_left = a_len - a_from;
+  const uint32_t b_left = b_len - b_from;
+  const uint32_t n = a_left < b_left ? a_left : b_left;
+  int cmp = 0;
+  if (n != 0) {
+    cmp = memcmp(a + a_from, b + b_from, n);
+  }
+  if (cmp != 0) {
+    return cmp;
+  }
+  if (a_len < b_len) {
+    return -1;
+  }
+  if (a_len > b_len) {
+    return 1;
+  }
+  return CmpFooter(a_foot, b_foot);
+}
+
+inline int BSkipList::CmpPastInline(const KeyView& key, const uint64_t* extra,
+                                    uint32_t other_len, uint64_t other_foot,
+                                    const char* other_user) const {
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    const int c = CmpPacked(key.extra[t], extra[t]);
+    if (c != 0) {
+      return c;
+    }
+  }
+  if (LIKELY(key.user_len <= kPrefixBytes && other_len <= kPrefixBytes)) {
+    if (key.user_len != other_len) {
+      return key.user_len < other_len ? -1 : 1;
+    }
+    return CmpFooter(key.footer, other_foot);
+  }
+  return CompareSuffix(key.user, key.user_len, key.footer, other_user, other_len,
+                       other_foot);
+}
+
 inline const char* BSkipList::FullUser(const SlotView& slot) const {
   if (slot.entry == nullptr || slot.user_len <= kInlineUserKey) {
     return slot.user;
@@ -480,8 +639,11 @@ inline int BSkipList::CompareKeyToSlot(const KeyView& key,
     }
     return CmpFooter(key.footer, slot.footer);
   }
-  return CompareFull(key.user, key.user_len, key.footer, FullUser(slot),
-                     slot.user_len, slot.footer);
+  const char* other = nullptr;
+  if (key.user_len > kPrefixBytes || slot.user_len > kPrefixBytes) {
+    other = FullUser(slot);
+  }
+  return CmpPastInline(key, slot.extra, slot.user_len, slot.footer, other);
 }
 
 inline int BSkipList::CompareKeyToNextHeader(const KeyView& key,
@@ -504,16 +666,33 @@ inline int BSkipList::CompareKeyToNextHeader(const KeyView& key,
     }
     return CmpFooter(key.footer, nfoot);
   }
-  Node* next = node->next.load(std::memory_order_relaxed);
-  assert(next != nullptr);
-  const char* entry = next->slots[0].entry.load(std::memory_order_relaxed);
-  assert(entry != nullptr);
-  Slice ikey = GetLengthPrefixedSlice(entry);
-  return CompareFull(key.user, key.user_len, key.footer, ikey.data(), nlen,
-                     nfoot);
+  uint64_t extra[kExtraWords];
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    extra[t] = node->next_extra[t].load(std::memory_order_relaxed);
+  }
+  const char* other = nullptr;
+  if (key.user_len > kPrefixBytes || nlen > kPrefixBytes) {
+    // The entry is needed only when bytes [0, 48) match.
+    bool prefix_equal = true;
+    for (uint32_t t = 0; t < kExtraWords; ++t) {
+      if (key.extra[t] != extra[t]) {
+        prefix_equal = false;
+        break;
+      }
+    }
+    if (prefix_equal) {
+      Node* next = node->next.load(std::memory_order_relaxed);
+      assert(next != nullptr);
+      const char* entry = next->slots[0].entry.load(std::memory_order_relaxed);
+      assert(entry != nullptr);
+      other = GetLengthPrefixedSlice(entry).data();
+    }
+  }
+  return CmpPastInline(key, extra, nlen, nfoot, other);
 }
 
-inline void BSkipList::StoreNextHeader(Node* node, const Slot& slot0) {
+inline void BSkipList::StoreNextHeader(Node* node, const Node* next_node) {
+  const Slot& slot0 = next_node->slots[0];
   node->next_user_len.store(slot0.user_len.load(std::memory_order_relaxed),
                             std::memory_order_relaxed);
   node->next_footer.store(slot0.footer.load(std::memory_order_relaxed),
@@ -522,6 +701,13 @@ inline void BSkipList::StoreNextHeader(Node* node, const Slot& slot0) {
                          std::memory_order_relaxed);
   node->next_word1.store(slot0.word1.load(std::memory_order_relaxed),
                          std::memory_order_relaxed);
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    uint64_t word = 0;
+    if (next_node->extra != nullptr) {
+      word = next_node->extra[t].load(std::memory_order_relaxed);
+    }
+    node->next_extra[t].store(word, std::memory_order_relaxed);
+  }
 }
 
 inline uint32_t BSkipList::FindRank(const Node* node, uint32_t count,
@@ -554,7 +740,33 @@ inline uint32_t BSkipList::FindRank(const Node* node, uint32_t count,
           cmp = CmpFooter(key.footer, sfoot);
         }
       } else {
-        cmp = CompareKeyToSlot(key, ReadSlot(node->slots[i]));
+        uint64_t extra[kExtraWords];
+        for (uint32_t t = 0; t < kExtraWords; ++t) {
+          extra[t] = 0;
+        }
+        if (node->extra != nullptr) {
+          const std::atomic<uint64_t>* row = node->extra + i * kExtraWords;
+          for (uint32_t t = 0; t < kExtraWords; ++t) {
+            extra[t] = row[t].load(std::memory_order_relaxed);
+          }
+        }
+        const char* other = nullptr;
+        bool need_suffix = key.user_len > kPrefixBytes || slen > kPrefixBytes;
+        if (need_suffix) {
+          bool prefix_equal = true;
+          for (uint32_t t = 0; t < kExtraWords; ++t) {
+            if (key.extra[t] != extra[t]) {
+              prefix_equal = false;
+              break;
+            }
+          }
+          if (prefix_equal) {
+            const char* entry =
+                node->slots[i].entry.load(std::memory_order_relaxed);
+            other = GetLengthPrefixedSlice(entry).data();
+          }
+        }
+        cmp = CmpPastInline(key, extra, slen, sfoot, other);
       }
       if (cmp < 0) {
         break;
@@ -567,7 +779,7 @@ inline uint32_t BSkipList::FindRank(const Node* node, uint32_t count,
     }
     rank = i;
   }
-  *at = ReadSlot(node->slots[rank]);
+  *at = ReadSlot(node, rank);
   return rank;
 }
 
@@ -626,7 +838,7 @@ inline bool BSkipList::KeyBelongs(Node* node, const KeyView& key) const {
   if (count == 0 || count > kFanout) {
     return false;
   }
-  const SlotView head = ReadSlot(node->slots[0]);
+  const SlotView head = ReadSlot(node, 0);
   if (head.entry != nullptr && CompareKeyToSlot(key, head) < 0) {
     return false;
   }
@@ -728,11 +940,11 @@ inline void BSkipList::SpliceLocked(Node* left, Node* neu,
   Node* right = left->next.load(std::memory_order_relaxed);
   neu->prev.store(left, std::memory_order_relaxed);
   if (right != nullptr) {
-    StoreNextHeader(neu, right->slots[0]);
+    StoreNextHeader(neu, right);
   }
   neu->next.store(right, std::memory_order_release);
   left->count.store(new_left_count, std::memory_order_relaxed);
-  StoreNextHeader(left, neu->slots[0]);
+  StoreNextHeader(left, neu);
   left->next.store(neu, std::memory_order_release);
   EndWrite(left);
   FixRightPrev(neu, right);
@@ -748,13 +960,13 @@ inline BSkipList::Node* BSkipList::PromotionSplitLocked(Node* node,
   const uint32_t count = node->count.load(std::memory_order_relaxed);
   assert(rank < count);
   Node* neu = NewNode(node->level);
-  WriteSlot(&neu->slots[0], key);
+  WriteSlot(neu, 0, key);
   if (node->level > 0) {
     neu->children[0].store(new_child, std::memory_order_relaxed);
   }
   const uint32_t move = count - (rank + 1);
   for (uint32_t i = 0; i < move; ++i) {
-    CopySlot(&neu->slots[1 + i], node->slots[rank + 1 + i]);
+    CopySlot(neu, 1 + i, node, rank + 1 + i);
     if (node->level > 0) {
       Node* child = node->children[rank + 1 + i].load(std::memory_order_relaxed);
       neu->children[1 + i].store(child, std::memory_order_relaxed);
@@ -774,7 +986,7 @@ inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
   SlotView slots[kFanout + 1];
   Node* kids[kFanout + 1];
   for (uint32_t i = 0; i < count; ++i) {
-    slots[i] = ReadSlot(node->slots[i]);
+    slots[i] = ReadSlot(node, i);
     if (node->level > 0) {
       kids[i] = node->children[i].load(std::memory_order_relaxed);
     }
@@ -791,6 +1003,9 @@ inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
   slots[pos].footer = key.footer;
   slots[pos].word0 = key.word0;
   slots[pos].word1 = key.word1;
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    slots[pos].extra[t] = key.extra[t];
+  }
   memset(slots[pos].user, 0, kInlineUserKey);
   const uint32_t ncopy =
       key.user_len < kInlineUserKey ? key.user_len : kInlineUserKey;
@@ -805,7 +1020,7 @@ inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
   const uint32_t right_count = total - left_count;
   Node* neu = NewNode(node->level);
   for (uint32_t i = 0; i < right_count; ++i) {
-    WriteSlot(&neu->slots[i], slots[left_count + i]);
+    WriteSlot(neu, i, slots[left_count + i]);
     if (node->level > 0) {
       neu->children[i].store(kids[left_count + i], std::memory_order_relaxed);
     }
@@ -815,17 +1030,17 @@ inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
   Node* right = node->next.load(std::memory_order_relaxed);
   neu->prev.store(node, std::memory_order_relaxed);
   if (right != nullptr) {
-    StoreNextHeader(neu, right->slots[0]);
+    StoreNextHeader(neu, right);
   }
   neu->next.store(right, std::memory_order_release);
   for (uint32_t i = 1; i < left_count; ++i) {
-    WriteSlot(&node->slots[i], slots[i]);
+    WriteSlot(node, i, slots[i]);
     if (node->level > 0) {
       node->children[i].store(kids[i], std::memory_order_relaxed);
     }
   }
   node->count.store(left_count, std::memory_order_relaxed);
-  StoreNextHeader(node, neu->slots[0]);
+  StoreNextHeader(node, neu);
   node->next.store(neu, std::memory_order_release);
   EndWrite(node);
   FixRightPrev(neu, right);
@@ -841,13 +1056,13 @@ inline void BSkipList::ShiftInsertLocked(Node* node, uint32_t pos,
   assert(pos > 0);
   assert(pos <= count);
   for (uint32_t i = count; i > pos; --i) {
-    CopySlot(&node->slots[i], node->slots[i - 1]);
+    CopySlot(node, i, node, i - 1);
     if (node->level > 0) {
       Node* moved = node->children[i - 1].load(std::memory_order_relaxed);
       node->children[i].store(moved, std::memory_order_relaxed);
     }
   }
-  WriteSlot(&node->slots[pos], key);
+  WriteSlot(node, pos, key);
   if (node->level > 0) {
     node->children[pos].store(child, std::memory_order_relaxed);
   }
@@ -865,7 +1080,7 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
   if (observed == 0 || observed > kFanout) {
     return false;
   }
-  const SlotView last = ReadSlot(leaf->slots[observed - 1]);
+  const SlotView last = ReadSlot(leaf, observed - 1);
   if (CompareKeyToSlot(key, last) <= 0) {
     return false;
   }
@@ -881,13 +1096,13 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
     EndWrite(leaf);
     return false;
   }
-  const SlotView locked_last = ReadSlot(leaf->slots[count - 1]);
+  const SlotView locked_last = ReadSlot(leaf, count - 1);
   if (CompareKeyToSlot(key, locked_last) <= 0) {
     EndWrite(leaf);
     return false;
   }
   if (count < kFanout) {
-    WriteSlot(&leaf->slots[count], key);
+    WriteSlot(leaf, count, key);
     leaf->count.store(count + 1, std::memory_order_relaxed);
     EndWrite(leaf);
     return true;
@@ -896,9 +1111,9 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
   Node* neu = NewNode(0);
   const uint32_t moved = kFanout - half;
   for (uint32_t i = 0; i < moved; ++i) {
-    CopySlot(&neu->slots[i], leaf->slots[half + i]);
+    CopySlot(neu, i, leaf, half + i);
   }
-  WriteSlot(&neu->slots[moved], key);
+  WriteSlot(neu, moved, key);
   neu->count.store(moved + 1, std::memory_order_relaxed);
   SpliceLocked(leaf, neu, half);
   return true;
@@ -977,11 +1192,11 @@ inline void BSkipList::SpliceAfter(Node* left, Node* neu,
   neu->prev.store(left, std::memory_order_relaxed);
   neu->next.store(right, std::memory_order_relaxed);
   if (right != nullptr) {
-    StoreNextHeader(neu, right->slots[0]);
+    StoreNextHeader(neu, right);
   }
   BeginWrite(left);
   left->count.store(new_left_count, std::memory_order_relaxed);
-  StoreNextHeader(left, neu->slots[0]);
+  StoreNextHeader(left, neu);
   left->next.store(neu, std::memory_order_relaxed);
   EndWrite(left);
   if (right != nullptr) {
@@ -1000,7 +1215,7 @@ inline bool BSkipList::TryAppend(const KeyView& key) {
   if (count == 0 || count > kFanout) {
     return false;
   }
-  const SlotView last = ReadSlot(leaf->slots[count - 1]);
+  const SlotView last = ReadSlot(leaf, count - 1);
   if (CompareKeyToSlot(key, last) <= 0) {
     return false;
   }
@@ -1010,7 +1225,7 @@ inline bool BSkipList::TryAppend(const KeyView& key) {
   }
   if (count < kFanout) {
     BeginWrite(leaf);
-    WriteSlot(&leaf->slots[count], key);
+    WriteSlot(leaf, count, key);
     leaf->count.store(count + 1, std::memory_order_relaxed);
     EndWrite(leaf);
     return true;
@@ -1020,9 +1235,9 @@ inline bool BSkipList::TryAppend(const KeyView& key) {
   Node* neu = NewNode(0);
   const uint32_t moved = kFanout - half;
   for (uint32_t i = 0; i < moved; ++i) {
-    CopySlot(&neu->slots[i], leaf->slots[half + i]);
+    CopySlot(neu, i, leaf, half + i);
   }
-  WriteSlot(&neu->slots[moved], key);
+  WriteSlot(neu, moved, key);
   neu->count.store(moved + 1, std::memory_order_relaxed);
   SpliceAfter(leaf, neu, half);
   return true;
@@ -1034,13 +1249,13 @@ inline BSkipList::Node* BSkipList::PromotionSplit(Node* node, uint32_t rank,
   const uint32_t count = node->count.load(std::memory_order_relaxed);
   assert(rank < count);
   Node* neu = NewNode(node->level);
-  WriteSlot(&neu->slots[0], key);
+  WriteSlot(neu, 0, key);
   if (node->level > 0) {
     neu->children[0].store(new_child, std::memory_order_relaxed);
   }
   const uint32_t move = count - (rank + 1);
   for (uint32_t i = 0; i < move; ++i) {
-    CopySlot(&neu->slots[1 + i], node->slots[rank + 1 + i]);
+    CopySlot(neu, 1 + i, node, rank + 1 + i);
     if (node->level > 0) {
       Node* child =
           node->children[rank + 1 + i].load(std::memory_order_relaxed);
@@ -1060,7 +1275,7 @@ inline void BSkipList::SplitAndInsert(Node* node, uint32_t rank,
   SlotView slots[kFanout + 1];
   Node* kids[kFanout + 1];
   for (uint32_t i = 0; i < count; ++i) {
-    slots[i] = ReadSlot(node->slots[i]);
+    slots[i] = ReadSlot(node, i);
     if (node->level > 0) {
       kids[i] = node->children[i].load(std::memory_order_relaxed);
     }
@@ -1077,6 +1292,9 @@ inline void BSkipList::SplitAndInsert(Node* node, uint32_t rank,
   slots[pos].footer = key.footer;
   slots[pos].word0 = key.word0;
   slots[pos].word1 = key.word1;
+  for (uint32_t t = 0; t < kExtraWords; ++t) {
+    slots[pos].extra[t] = key.extra[t];
+  }
   memset(slots[pos].user, 0, kInlineUserKey);
   const uint32_t ncopy =
       key.user_len < kInlineUserKey ? key.user_len : kInlineUserKey;
@@ -1091,7 +1309,7 @@ inline void BSkipList::SplitAndInsert(Node* node, uint32_t rank,
   const uint32_t right_count = total - left_count;
   Node* neu = NewNode(node->level);
   for (uint32_t i = 0; i < right_count; ++i) {
-    WriteSlot(&neu->slots[i], slots[left_count + i]);
+    WriteSlot(neu, i, slots[left_count + i]);
     if (node->level > 0) {
       neu->children[i].store(kids[left_count + i], std::memory_order_relaxed);
     }
@@ -1102,17 +1320,17 @@ inline void BSkipList::SplitAndInsert(Node* node, uint32_t rank,
   neu->prev.store(node, std::memory_order_relaxed);
   neu->next.store(right, std::memory_order_relaxed);
   if (right != nullptr) {
-    StoreNextHeader(neu, right->slots[0]);
+    StoreNextHeader(neu, right);
   }
   BeginWrite(node);
   for (uint32_t i = 1; i < left_count; ++i) {
-    WriteSlot(&node->slots[i], slots[i]);
+    WriteSlot(node, i, slots[i]);
     if (node->level > 0) {
       node->children[i].store(kids[i], std::memory_order_relaxed);
     }
   }
   node->count.store(left_count, std::memory_order_relaxed);
-  StoreNextHeader(node, neu->slots[0]);
+  StoreNextHeader(node, neu);
   node->next.store(neu, std::memory_order_relaxed);
   EndWrite(node);
   if (right != nullptr) {
@@ -1133,13 +1351,13 @@ inline void BSkipList::ShiftInsert(Node* node, uint32_t pos, const KeyView& key,
   assert(pos <= count);
   BeginWrite(node);
   for (uint32_t i = count; i > pos; --i) {
-    CopySlot(&node->slots[i], node->slots[i - 1]);
+    CopySlot(node, i, node, i - 1);
     if (node->level > 0) {
       Node* moved = node->children[i - 1].load(std::memory_order_relaxed);
       node->children[i].store(moved, std::memory_order_relaxed);
     }
   }
-  WriteSlot(&node->slots[pos], key);
+  WriteSlot(node, pos, key);
   if (node->level > 0) {
     node->children[pos].store(child, std::memory_order_relaxed);
   }
@@ -1350,7 +1568,7 @@ inline uint64_t BSkipList::ApproximateNumEntries(const Slice& start_ikey,
       const uint32_t count = node->count.load(std::memory_order_relaxed);
       bool stop = false;
       for (uint32_t i = 0; i < count && i < kFanout; ++i) {
-        const SlotView slot = ReadSlot(node->slots[i]);
+        const SlotView slot = ReadSlot(node, i);
         if (slot.entry == nullptr) {
           continue;
         }
@@ -1430,7 +1648,7 @@ inline void BSkipList::TEST_Validate() const {
       SlotView previous;
       bool have_previous = false;
       for (uint32_t i = 0; i < count; ++i) {
-        const SlotView slot = ReadSlot(node->slots[i]);
+        const SlotView slot = ReadSlot(node, i);
         if (i == 0 && prev == nullptr) {
           assert(slot.entry == nullptr);
         }
@@ -1451,7 +1669,7 @@ inline void BSkipList::TEST_Validate() const {
         if (level > 0) {
           Node* child = node->children[i].load(std::memory_order_relaxed);
           assert(child != nullptr);
-          const SlotView child_head = ReadSlot(child->slots[0]);
+          const SlotView child_head = ReadSlot(child, 0);
           if (slot.entry == nullptr) {
             assert(child_head.entry == nullptr);
           } else if (child_head.entry != nullptr) {
@@ -1468,7 +1686,7 @@ inline void BSkipList::TEST_Validate() const {
       Node* next = node->next.load(std::memory_order_relaxed);
 #ifndef NDEBUG
       if (next != nullptr) {
-        const SlotView next_head = ReadSlot(next->slots[0]);
+        const SlotView next_head = ReadSlot(next, 0);
         assert(next_head.entry != nullptr);
         KeyView probe;
         probe.entry = next_head.entry;
@@ -1478,6 +1696,9 @@ inline void BSkipList::TEST_Validate() const {
         probe.footer = next_head.footer;
         probe.word0 = next_head.word0;
         probe.word1 = next_head.word1;
+        for (uint32_t t = 0; t < kExtraWords; ++t) {
+          probe.extra[t] = next_head.extra[t];
+        }
         assert(CompareKeyToNextHeader(probe, node) == 0);
       }
 #endif
@@ -1519,7 +1740,7 @@ inline void BSkipList::Iterator::Seek(const char* target) {
       if (!list_->ReadEntryAt(leaf, rank, &entry, &next) || entry == nullptr) {
         continue;
       }
-      const SlotView slot = list_->ReadSlot(leaf->slots[rank]);
+      const SlotView slot = list_->ReadSlot(leaf, rank);
       std::atomic_thread_fence(std::memory_order_acquire);
       if (list_->CompareKeyToSlot(key, slot) != 0 || slot.entry == nullptr) {
         continue;
@@ -1569,7 +1790,7 @@ inline void BSkipList::Iterator::SeekForPrev(const char* target) {
     return;
   }
   const KeyView key = list_->ParseEntry(target);
-  const SlotView slot = list_->ReadSlot(leaf_->slots[index_]);
+  const SlotView slot = list_->ReadSlot(leaf_, index_);
   if (slot.entry == key_ && list_->CompareKeyToSlot(key, slot) == 0) {
     return;
   }
