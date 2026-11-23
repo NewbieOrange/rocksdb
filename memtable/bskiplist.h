@@ -263,6 +263,8 @@ class BSkipList {
                     uint64_t other_foot, const char* other_user) const;
   const char* FullUser(const SlotView& slot) const;
   int CompareKeyToSlot(const KeyView& key, const SlotView& slot) const;
+  int CompareKeyToSlotAt(const KeyView& key, const Node* node,
+                         uint32_t index) const;
   int CompareKeyToNextHeader(const KeyView& key, const Node* node) const;
   void StoreNextHeader(Node* node, const Node* next_node);
   Rank FindRank(const Node* node, uint32_t count, const KeyView& key) const;
@@ -684,6 +686,60 @@ inline int BSkipList::CompareKeyToSlot(const KeyView& key,
   return CmpPastInline(key, slot.extra, slot.user_len, slot.footer, other);
 }
 
+inline int BSkipList::CompareKeyToSlotAt(const KeyView& key, const Node* node,
+                                         uint32_t index) const {
+  const Slot& slot = node->slots[index];
+  if (slot.entry.load(std::memory_order_relaxed) == nullptr) {
+    return 1;
+  }
+  const int c0 =
+      CmpPacked(key.word0, slot.word0.load(std::memory_order_relaxed));
+  if (c0 != 0) {
+    return c0;
+  }
+  const int c1 =
+      CmpPacked(key.word1, slot.word1.load(std::memory_order_relaxed));
+  if (c1 != 0) {
+    return c1;
+  }
+  const uint32_t slot_len = slot.user_len.load(std::memory_order_relaxed);
+  if (LIKELY(key.user_len <= kInlineUserKey && slot_len <= kInlineUserKey)) {
+    if (key.user_len != slot_len) {
+      return key.user_len < slot_len ? -1 : 1;
+    }
+    return CmpFooter(key.footer, slot.footer.load(std::memory_order_relaxed));
+  }
+  uint64_t extra[kExtraWords];
+  const std::atomic<uint64_t>* row =
+      node->extra.load(std::memory_order_relaxed);
+  if (row != nullptr) {
+    row += index * kExtraWords;
+    for (uint32_t t = 0; t < kExtraWords; ++t) {
+      extra[t] = row[t].load(std::memory_order_relaxed);
+    }
+  } else {
+    for (uint32_t t = 0; t < kExtraWords; ++t) {
+      extra[t] = 0;
+    }
+  }
+  const char* other = nullptr;
+  if (key.user_len > kPrefixBytes || slot_len > kPrefixBytes) {
+    bool prefix_equal = true;
+    for (uint32_t t = 0; t < kExtraWords; ++t) {
+      if (key.extra[t] != extra[t]) {
+        prefix_equal = false;
+        break;
+      }
+    }
+    if (prefix_equal) {
+      const char* entry = slot.entry.load(std::memory_order_relaxed);
+      other = GetLengthPrefixedSlice(entry).data();
+    }
+  }
+  return CmpPastInline(key, extra, slot_len,
+                       slot.footer.load(std::memory_order_relaxed), other);
+}
+
 inline int BSkipList::CompareKeyToNextHeader(const KeyView& key,
                                              const Node* node) const {
   const uint64_t nw0 = node->next_word0.load(std::memory_order_relaxed);
@@ -831,8 +887,7 @@ inline BSkipList::Rank BSkipList::FindRank(const Node* node, uint32_t count,
   const Slot& head = node->slots[0];
   if (rank == 0 && head.entry.load(std::memory_order_relaxed) != nullptr &&
       head.word0.load(std::memory_order_relaxed) == kw0) {
-    const SlotView head_view = ReadSlot(node, 0);
-    equal = CompareKeyToSlot(key, head_view) == 0;
+    equal = CompareKeyToSlotAt(key, node, 0) == 0;
   }
   return {rank, equal};
 }
@@ -917,8 +972,7 @@ inline bool BSkipList::KeyBelongs(Node* node, const KeyView& key) const {
   if (count == 0 || count > kFanout) {
     return false;
   }
-  const SlotView head = ReadSlot(node, 0);
-  if (head.entry != nullptr && CompareKeyToSlot(key, head) < 0) {
+  if (CompareKeyToSlotAt(key, node, 0) < 0) {
     return false;
   }
   if (node->next.load(std::memory_order_relaxed) != nullptr &&
@@ -1177,8 +1231,10 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
     if (observed == 0 || observed > kFanout) {
       return false;
     }
-    const SlotView last = ReadSlot(leaf, observed - 1);
-    if (CompareKeyToSlot(key, last) <= 0) {
+    const bool append = CompareKeyToSlotAt(key, leaf, observed - 1) > 0;
+    // Out-of-order keys that still belong in the tail node can be inserted
+    // here too. Only keys from earlier nodes need the full search.
+    if (!append && CompareKeyToSlotAt(key, leaf, 0) < 0) {
       return false;
     }
     if (leaf->next.load(std::memory_order_acquire) != nullptr &&
@@ -1210,20 +1266,53 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
       EndWrite(leaf);
       return false;
     }
-    const SlotView locked_last = ReadSlot(leaf, count - 1);
-    if (CompareKeyToSlot(key, locked_last) <= 0) {
+    if (append && CompareKeyToSlotAt(key, leaf, count - 1) > 0) {
+      if (count < kFanout) {
+        if (key.user_len > kInlineUserKey &&
+            leaf->extra.load(std::memory_order_relaxed) == nullptr) {
+          EndWrite(leaf);
+          continue;
+        }
+        WriteSlot(leaf, count, key);
+        leaf->count.store(count + 1, std::memory_order_relaxed);
+        EndWrite(leaf);
+        return true;
+      }
+      const bool copy_extra =
+          key.user_len > kInlineUserKey ||
+          leaf->extra.load(std::memory_order_relaxed) != nullptr;
+      if (spare == nullptr ||
+          (copy_extra &&
+           spare->extra.load(std::memory_order_relaxed) == nullptr)) {
+        EndWrite(leaf);
+        continue;
+      }
+      constexpr uint32_t half = kFanout / 2;
+      const uint32_t moved = kFanout - half;
+      Node* neu = spare;
+      spare = nullptr;
+      for (uint32_t i = 0; i < moved; ++i) {
+        CopySlot(neu, i, leaf, half + i);
+      }
+      WriteSlot(neu, moved, key);
+      neu->count.store(moved + 1, std::memory_order_relaxed);
+      SpliceLocked(leaf, neu, half);
+      return true;
+    }
+    // The key belongs inside the tail node. Shift locally instead of walking
+    // the tree, which is common when concurrent writers arrive out of order.
+    if (key.user_len > kInlineUserKey &&
+        leaf->extra.load(std::memory_order_relaxed) == nullptr) {
+      EndWrite(leaf);
+      continue;
+    }
+    const Rank found = FindRank(leaf, count, key);
+    if (found.equal) {
       EndWrite(leaf);
       return false;
     }
     if (count < kFanout) {
-      if (key.user_len > kInlineUserKey &&
-          leaf->extra.load(std::memory_order_relaxed) == nullptr) {
-        EndWrite(leaf);
-        continue;
-      }
-      WriteSlot(leaf, count, key);
-      leaf->count.store(count + 1, std::memory_order_relaxed);
-      EndWrite(leaf);
+      ShiftInsertLocked(leaf, found.index + 1, key, nullptr);
       return true;
     }
     const bool copy_extra =
@@ -1235,16 +1324,7 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
       EndWrite(leaf);
       continue;
     }
-    constexpr uint32_t half = kFanout / 2;
-    const uint32_t moved = kFanout - half;
-    Node* neu = spare;
-    spare = nullptr;
-    for (uint32_t i = 0; i < moved; ++i) {
-      CopySlot(neu, i, leaf, half + i);
-    }
-    WriteSlot(neu, moved, key);
-    neu->count.store(moved + 1, std::memory_order_relaxed);
-    SpliceLocked(leaf, neu, half);
+    SplitAndInsertLocked(leaf, found.index, key, nullptr, spare);
     return true;
   }
   return false;
@@ -1386,8 +1466,7 @@ inline bool BSkipList::TryAppend(const KeyView& key) {
   if (count == 0 || count > kFanout) {
     return false;
   }
-  const SlotView last = ReadSlot(leaf, count - 1);
-  if (CompareKeyToSlot(key, last) <= 0) {
+  if (CompareKeyToSlotAt(key, leaf, count - 1) <= 0) {
     return false;
   }
   if (leaf->next.load(std::memory_order_relaxed) != nullptr &&
