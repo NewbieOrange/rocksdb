@@ -317,6 +317,70 @@ TEST(BSkipListMemtableTest, ConcurrentInserts) {
   ExpectMatches(list, expected);
 }
 
+TEST(BSkipListMemtableTest, ContendedAppends) {
+  ConcurrentArena arena;
+  BSkipList list(&arena);
+  constexpr int kThreads = 8;
+  constexpr int kPerThread = 600;
+  std::atomic<uint64_t> ticket{0};
+  std::atomic<bool> stop{false};
+  std::mutex mu;
+  KeySet expected;
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&]() {
+      KeySet local;
+      auto add = [&](const std::string& user, uint64_t seq) {
+        std::string encoded = Encode(user, seq);
+        char* buf = list.AllocateKey(encoded.size());
+        memcpy(buf, encoded.data(), encoded.size());
+        ASSERT_TRUE(list.InsertConcurrently(buf));
+        local.insert({user, seq});
+      };
+      for (int i = 0; i < kPerThread; ++i) {
+        const uint64_t n = ticket.fetch_add(1, std::memory_order_relaxed);
+        char user[32];
+        snprintf(user, sizeof(user), "a%08llu",
+                 static_cast<unsigned long long>(n));
+        add(user, 1);
+        // Same user key, newer sequences sort first and split one node.
+        add("hot", n + 1);
+        if (i % 8 == 0) {
+          const std::string long_key =
+              std::string(48, 'k') + "-" + std::to_string(n);
+          add(long_key, 1);
+        }
+      }
+      std::lock_guard<std::mutex> lock(mu);
+      expected.insert(local.begin(), local.end());
+    });
+  }
+  std::vector<port::Thread> readers;
+  for (int r = 0; r < 2; ++r) {
+    readers.emplace_back([&]() {
+      while (!stop.load(std::memory_order_relaxed)) {
+        BSkipList::Iterator it(&list);
+        it.SeekToFirst();
+        for (int n = 0; n < 32 && it.Valid(); ++n) {
+          it.Next();
+        }
+        it.SeekToLast();
+        if (it.Valid()) {
+          it.Prev();
+        }
+      }
+    });
+  }
+  for (port::Thread& thread : threads) {
+    thread.join();
+  }
+  stop.store(true, std::memory_order_relaxed);
+  for (port::Thread& reader : readers) {
+    reader.join();
+  }
+  ExpectMatches(list, expected);
+}
+
 TEST(BSkipListMemtableTest, ConcurrentInsertsAndDB) {
   const std::string dbname = test::PerThreadDBPath("bskiplist_db");
   ASSERT_OK(DestroyDB(dbname, Options()));

@@ -15,6 +15,11 @@
 // never freed until the list is destroyed, so a reader that loads a node
 // pointer can always dereference it.
 //
+// The seqlock stays odd only while a writer copies slots and swings
+// pointers. Allocation takes the arena lock and can page-fault; doing that
+// with the seqlock held, while other writers pause-spin on the same node,
+// keeps the owner off-CPU and the write stalls.
+//
 // Ordering is bytewise on the user key, then descending internal-key footer
 // (sequence and type). That matches InternalKeyComparator with
 // BytewiseComparator. The caller must refuse any other comparator.
@@ -31,6 +36,7 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -157,7 +163,7 @@ class BSkipList {
     Slot() : word0(0), word1(0), footer(0), user_len(0), entry(nullptr) {}
   };
 
-  struct Node {
+  struct alignas(64) Node {
     std::atomic<uint32_t> seq;
     std::atomic<uint32_t> count;
     // Bytes [16, 48) of each slot, `kFanout * kExtraWords` words. Null when
@@ -203,6 +209,10 @@ class BSkipList {
 
   static_assert(sizeof(Node) % alignof(std::atomic<Node*>) == 0,
                 "children array must be aligned");
+  static_assert(offsetof(Node, slots) == 64,
+                "slots must start on the cache line after the seqlock");
+  static_assert(sizeof(Node) % 64 == 0,
+                "node size is a multiple of a cache line");
 
   struct Step {
     Node* node;
@@ -267,10 +277,11 @@ class BSkipList {
   void SpliceLocked(Node* left, Node* neu, uint32_t new_left_count);
   void FixRightPrev(Node* neu, Node* right);
   void PublishTail(Node* candidate);
+  // `neu` is allocated by the caller before the seqlock is taken.
   Node* PromotionSplitLocked(Node* node, uint32_t rank, const KeyView& key,
-                             Node* new_child);
+                             Node* new_child, Node* neu);
   void SplitAndInsertLocked(Node* node, uint32_t rank, const KeyView& key,
-                            Node* new_child);
+                            Node* new_child, Node* neu);
   void ShiftInsertLocked(Node* node, uint32_t pos, const KeyView& key,
                          Node* child);
   bool TryAppendConcurrent(const KeyView& key);
@@ -430,12 +441,17 @@ inline BSkipList::Node* BSkipList::NewNode(uint32_t level) {
   if (level > 0) {
     bytes += sizeof(std::atomic<Node*>) * kFanout;
   }
-  char* mem = allocator_->AllocateAligned(bytes);
-  Node* node = new (mem) Node(level);
+  // Arena::AllocateAligned aligns to max_align_t. The seqlock and the cached
+  // separator occupy the first 64 bytes only when the node itself is aligned.
+  constexpr size_t kLine = 64;
+  char* mem = allocator_->AllocateAligned(bytes + kLine - 1);
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(mem);
+  char* placed = reinterpret_cast<char*>((addr + (kLine - 1)) & ~(kLine - 1));
+  Node* node = new (placed) Node(level);
   if (level > 0) {
     // Construct each pointer in place. Array placement-new is not portable:
     // some standard libraries store a size cookie in front of the array.
-    void* raw = mem + sizeof(Node);
+    void* raw = placed + sizeof(Node);
     node->children = static_cast<std::atomic<Node*>*>(raw);
     for (uint32_t i = 0; i < kFanout; ++i) {
       new (node->children + i) std::atomic<Node*>(nullptr);
@@ -464,7 +480,12 @@ inline void BSkipList::EnsureExtra(Node* node) const {
   for (size_t i = 0; i < n; ++i) {
     new (words + i) std::atomic<uint64_t>(0);
   }
-  node->extra.store(words, std::memory_order_release);
+  std::atomic<uint64_t>* expected = nullptr;
+  // Lost the race: the arena never frees, so the unused array dies with the
+  // memtable. Callers must not be holding this node's seqlock; allocation
+  // here is the stall the concurrent insert path avoids.
+  node->extra.compare_exchange_strong(expected, words, std::memory_order_release,
+                                      std::memory_order_acquire);
 }
 
 inline void BSkipList::WriteSlot(Node* node, uint32_t index,
@@ -819,7 +840,10 @@ inline BSkipList::Rank BSkipList::FindRank(const Node* node, uint32_t count,
 inline BSkipList::Node* BSkipList::WalkRight(Node* node,
                                              const KeyView& key) const {
   for (;;) {
-    Node* next = node->next.load(std::memory_order_relaxed);
+    // Acquire so the successor's constructor and slot stores, which happen
+    // before the releasing store of this pointer, are visible. A relaxed load
+    // lets a search observe a node that is still being built.
+    Node* next = node->next.load(std::memory_order_acquire);
     if (next == nullptr) {
       return node;
     }
@@ -845,7 +869,11 @@ inline int BSkipList::RandomHeight() const {
 inline void BSkipList::BeginWrite(Node* node) const {
   const uint32_t seq = node->seq.load(std::memory_order_relaxed);
   assert((seq & 1u) == 0);
-  node->seq.store(seq + 1, std::memory_order_release);
+  // A release store orders earlier writes, not the data stores that follow.
+  // Mark the lock with a relaxed store and then a release fence so readers
+  // cannot observe those stores while the seqlock still looks even.
+  node->seq.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
 }
 
 inline void BSkipList::EndWrite(Node* node) const {
@@ -859,13 +887,28 @@ inline bool BSkipList::TryLockNode(Node* node) const {
   if ((seq & 1u) != 0) {
     return false;
   }
-  return node->seq.compare_exchange_strong(
-      seq, seq + 1, std::memory_order_acq_rel, std::memory_order_acquire);
+  if (!node->seq.compare_exchange_strong(seq, seq + 1,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+    return false;
+  }
+  // Same fence as BeginWrite: the CAS releases earlier work, not the writes
+  // this critical section is about to publish.
+  std::atomic_thread_fence(std::memory_order_release);
+  return true;
 }
 
 inline void BSkipList::LockNode(Node* node) const {
-  while (UNLIKELY(!TryLockNode(node))) {
+  // Match SpinMutex. Pause-only spinning pins every waiter; if the owner is
+  // descheduled, those waiters keep it off-CPU and the insert hangs.
+  for (size_t tries = 0;; ++tries) {
+    if (TryLockNode(node)) {
+      return;
+    }
     port::AsmVolatilePause();
+    if (tries > 100) {
+      std::this_thread::yield();
+    }
   }
 }
 
@@ -888,11 +931,16 @@ inline bool BSkipList::KeyBelongs(Node* node, const KeyView& key) const {
 inline BSkipList::Node* BSkipList::Locate(const KeyView& key,
                                           int target_level) const {
   const int top = height_.load(std::memory_order_acquire);
-  if (target_level >= top) {
-    return headers_[target_level];
+  // A header exists at every level before height_ is published, and a
+  // promotion links further nodes at that level first. Stopping at the
+  // header skips those nodes, so every other inserter retries until the
+  // publisher finishes. Walk the level anyway.
+  int start = top > 0 ? top - 1 : 0;
+  if (target_level > start) {
+    start = target_level;
   }
-  Node* node = headers_[top - 1];
-  for (int level = top - 1; level >= target_level; --level) {
+  Node* node = headers_[start];
+  for (int level = start; level >= target_level; --level) {
     node = WalkRight(node, key);
     if (node->level != static_cast<uint32_t>(level)) {
       return nullptr;
@@ -900,12 +948,21 @@ inline BSkipList::Node* BSkipList::Locate(const KeyView& key,
     if (level == target_level) {
       return node;
     }
-    const uint32_t count = node->count.load(std::memory_order_acquire);
+    const uint32_t seq1 = node->seq.load(std::memory_order_acquire);
+    if ((seq1 & 1u) != 0) {
+      return nullptr;
+    }
+    const uint32_t count = node->count.load(std::memory_order_relaxed);
     if (count == 0 || count > kFanout || node->children == nullptr) {
       return nullptr;
     }
     const Rank found = FindRank(node, count, key);
-    Node* child = node->children[found.index].load(std::memory_order_acquire);
+    Node* child =
+        node->children[found.index].load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (node->seq.load(std::memory_order_relaxed) != seq1) {
+      return nullptr;
+    }
     if (child == nullptr) {
       return nullptr;
     }
@@ -918,11 +975,10 @@ inline void BSkipList::FixRightPrev(Node* neu, Node* right) {
   if (right == nullptr) {
     return;
   }
-  // Hold only `right`. Re-walk from `neu`: a later splice may already have
-  // linked a node between `neu` and `right`, and it will also take this lock.
-  // The last writer to finish the walk stores the predecessor that is current
-  // at that moment.
-  LockNode(right);
+  // `prev` is only used by reverse iteration. Walk before taking the lock so
+  // a long chain does not keep `right` odd, then store only if `pred` is
+  // still the immediate predecessor. A splice that landed in between updates
+  // `prev` itself.
   Node* pred = neu;
   for (;;) {
     Node* nxt = pred->next.load(std::memory_order_acquire);
@@ -931,6 +987,7 @@ inline void BSkipList::FixRightPrev(Node* neu, Node* right) {
     }
     pred = nxt;
   }
+  LockNode(right);
   if (pred->next.load(std::memory_order_acquire) == right) {
     right->prev.store(pred, std::memory_order_relaxed);
   }
@@ -991,10 +1048,11 @@ inline void BSkipList::SpliceLocked(Node* left, Node* neu,
 inline BSkipList::Node* BSkipList::PromotionSplitLocked(Node* node,
                                                         uint32_t rank,
                                                         const KeyView& key,
-                                                        Node* new_child) {
+                                                        Node* new_child,
+                                                        Node* neu) {
   const uint32_t count = node->count.load(std::memory_order_relaxed);
   assert(rank < count);
-  Node* neu = NewNode(node->level);
+  assert(neu != nullptr);
   WriteSlot(neu, 0, key);
   if (node->level > 0) {
     neu->children[0].store(new_child, std::memory_order_relaxed);
@@ -1014,7 +1072,7 @@ inline BSkipList::Node* BSkipList::PromotionSplitLocked(Node* node,
 
 inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
                                             const KeyView& key,
-                                            Node* new_child) {
+                                            Node* new_child, Node* neu) {
   const uint32_t count = node->count.load(std::memory_order_relaxed);
   assert(count == kFanout);
   assert(rank < count);
@@ -1053,7 +1111,7 @@ inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
   const uint32_t total = count + 1;
   const uint32_t left_count = total / 2;
   const uint32_t right_count = total - left_count;
-  Node* neu = NewNode(node->level);
+  assert(neu != nullptr);
   for (uint32_t i = 0; i < right_count; ++i) {
     WriteSlot(neu, i, slots[left_count + i]);
     if (node->level > 0) {
@@ -1106,57 +1164,96 @@ inline void BSkipList::ShiftInsertLocked(Node* node, uint32_t pos,
 }
 
 inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
-  Node* leaf = tail_.load(std::memory_order_acquire);
-  if (leaf == nullptr) {
-    return false;
-  }
-  // Reject without locking. Random inserts must not queue on the tail.
-  const uint32_t observed = leaf->count.load(std::memory_order_acquire);
-  if (observed == 0 || observed > kFanout) {
-    return false;
-  }
-  const SlotView last = ReadSlot(leaf, observed - 1);
-  if (CompareKeyToSlot(key, last) <= 0) {
-    return false;
-  }
-  if (leaf->next.load(std::memory_order_acquire) != nullptr &&
-      CompareKeyToNextHeader(key, leaf) >= 0) {
-    return false;
-  }
-  if (!TryLockNode(leaf)) {
-    return false;
-  }
-  const uint32_t count = leaf->count.load(std::memory_order_relaxed);
-  if (count == 0 || count > kFanout || !KeyBelongs(leaf, key)) {
-    EndWrite(leaf);
-    return false;
-  }
-  const SlotView locked_last = ReadSlot(leaf, count - 1);
-  if (CompareKeyToSlot(key, locked_last) <= 0) {
-    EndWrite(leaf);
-    return false;
-  }
-  if (count < kFanout) {
-    WriteSlot(leaf, count, key);
-    leaf->count.store(count + 1, std::memory_order_relaxed);
-    EndWrite(leaf);
+  // One spare node, reused across attempts. Allocating it while the tail
+  // seqlock is held is what stalls every other appender.
+  Node* spare = nullptr;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    Node* leaf = tail_.load(std::memory_order_acquire);
+    if (leaf == nullptr || leaf->level != 0) {
+      return false;
+    }
+    // Reject without locking. Random inserts must not queue on the tail.
+    const uint32_t observed = leaf->count.load(std::memory_order_acquire);
+    if (observed == 0 || observed > kFanout) {
+      return false;
+    }
+    const SlotView last = ReadSlot(leaf, observed - 1);
+    if (CompareKeyToSlot(key, last) <= 0) {
+      return false;
+    }
+    if (leaf->next.load(std::memory_order_acquire) != nullptr &&
+        CompareKeyToNextHeader(key, leaf) >= 0) {
+      return false;
+    }
+    if (key.user_len > kInlineUserKey &&
+        leaf->extra.load(std::memory_order_acquire) == nullptr) {
+      EnsureExtra(leaf);
+    }
+    if (observed >= kFanout) {
+      const bool copy_extra =
+          key.user_len > kInlineUserKey ||
+          leaf->extra.load(std::memory_order_acquire) != nullptr;
+      if (spare == nullptr) {
+        spare = NewNode(0);
+      }
+      if (copy_extra &&
+          spare->extra.load(std::memory_order_acquire) == nullptr) {
+        EnsureExtra(spare);
+      }
+    }
+    if (!TryLockNode(leaf)) {
+      port::AsmVolatilePause();
+      continue;
+    }
+    const uint32_t count = leaf->count.load(std::memory_order_relaxed);
+    if (count == 0 || count > kFanout || !KeyBelongs(leaf, key)) {
+      EndWrite(leaf);
+      return false;
+    }
+    const SlotView locked_last = ReadSlot(leaf, count - 1);
+    if (CompareKeyToSlot(key, locked_last) <= 0) {
+      EndWrite(leaf);
+      return false;
+    }
+    if (count < kFanout) {
+      if (key.user_len > kInlineUserKey &&
+          leaf->extra.load(std::memory_order_relaxed) == nullptr) {
+        EndWrite(leaf);
+        continue;
+      }
+      WriteSlot(leaf, count, key);
+      leaf->count.store(count + 1, std::memory_order_relaxed);
+      EndWrite(leaf);
+      return true;
+    }
+    const bool copy_extra =
+        key.user_len > kInlineUserKey ||
+        leaf->extra.load(std::memory_order_relaxed) != nullptr;
+    if (spare == nullptr ||
+        (copy_extra &&
+         spare->extra.load(std::memory_order_relaxed) == nullptr)) {
+      EndWrite(leaf);
+      continue;
+    }
+    constexpr uint32_t half = kFanout / 2;
+    const uint32_t moved = kFanout - half;
+    Node* neu = spare;
+    spare = nullptr;
+    for (uint32_t i = 0; i < moved; ++i) {
+      CopySlot(neu, i, leaf, half + i);
+    }
+    WriteSlot(neu, moved, key);
+    neu->count.store(moved + 1, std::memory_order_relaxed);
+    SpliceLocked(leaf, neu, half);
     return true;
   }
-  constexpr uint32_t half = kFanout / 2;
-  Node* neu = NewNode(0);
-  const uint32_t moved = kFanout - half;
-  for (uint32_t i = 0; i < moved; ++i) {
-    CopySlot(neu, i, leaf, half + i);
-  }
-  WriteSlot(neu, moved, key);
-  neu->count.store(moved + 1, std::memory_order_relaxed);
-  SpliceLocked(leaf, neu, half);
-  return true;
+  return false;
 }
 
 inline BSkipList::Node* BSkipList::PromoteConcurrent(const KeyView& key,
                                                      int level,
                                                      Node* new_child) {
+  Node* spare = nullptr;
   for (;;) {
     Node* node = Locate(key, level);
     if (node == nullptr || node->level != static_cast<uint32_t>(level)) {
@@ -1174,17 +1271,37 @@ inline BSkipList::Node* BSkipList::PromoteConcurrent(const KeyView& key,
       EndWrite(node);
       return nullptr;
     }
-    return PromotionSplitLocked(node, found.index, key, new_child);
+    const bool copy_extra =
+        key.user_len > kInlineUserKey ||
+        node->extra.load(std::memory_order_relaxed) != nullptr;
+    if (spare == nullptr ||
+        (copy_extra &&
+         spare->extra.load(std::memory_order_relaxed) == nullptr)) {
+      EndWrite(node);
+      if (spare == nullptr) {
+        spare = NewNode(node->level);
+      }
+      if (copy_extra) {
+        EnsureExtra(spare);
+      }
+      continue;
+    }
+    return PromotionSplitLocked(node, found.index, key, new_child, spare);
   }
 }
 
 inline bool BSkipList::InsertAtLevelConcurrent(const KeyView& key, int level,
                                                Node* child) {
+  Node* spare = nullptr;
   for (;;) {
     Node* node = Locate(key, level);
     if (node == nullptr || node->level != static_cast<uint32_t>(level)) {
       port::AsmVolatilePause();
       continue;
+    }
+    if (key.user_len > kInlineUserKey &&
+        node->extra.load(std::memory_order_acquire) == nullptr) {
+      EnsureExtra(node);
     }
     LockNode(node);
     if (!KeyBelongs(node, key)) {
@@ -1199,8 +1316,29 @@ inline bool BSkipList::InsertAtLevelConcurrent(const KeyView& key, int level,
       // present, so the key is in the list.
       return child != nullptr;
     }
+    if (key.user_len > kInlineUserKey &&
+        node->extra.load(std::memory_order_relaxed) == nullptr) {
+      EndWrite(node);
+      EnsureExtra(node);
+      continue;
+    }
     if (count >= kFanout) {
-      SplitAndInsertLocked(node, found.index, key, child);
+      const bool copy_extra =
+          key.user_len > kInlineUserKey ||
+          node->extra.load(std::memory_order_relaxed) != nullptr;
+      if (spare == nullptr ||
+          (copy_extra &&
+           spare->extra.load(std::memory_order_relaxed) == nullptr)) {
+        EndWrite(node);
+        if (spare == nullptr) {
+          spare = NewNode(static_cast<uint32_t>(level));
+        }
+        if (copy_extra) {
+          EnsureExtra(spare);
+        }
+        continue;
+      }
+      SplitAndInsertLocked(node, found.index, key, child, spare);
     } else {
       ShiftInsertLocked(node, found.index + 1, key, child);
     }
@@ -1223,14 +1361,14 @@ inline void BSkipList::SpliceAfter(Node* left, Node* neu,
                                    uint32_t new_left_count) {
   Node* right = left->next.load(std::memory_order_relaxed);
   neu->prev.store(left, std::memory_order_relaxed);
-  neu->next.store(right, std::memory_order_relaxed);
+  neu->next.store(right, std::memory_order_release);
   if (right != nullptr) {
     StoreNextHeader(neu, right);
   }
   BeginWrite(left);
   left->count.store(new_left_count, std::memory_order_relaxed);
   StoreNextHeader(left, neu);
-  left->next.store(neu, std::memory_order_relaxed);
+  left->next.store(neu, std::memory_order_release);
   EndWrite(left);
   if (right != nullptr) {
     BeginWrite(right);
@@ -1257,6 +1395,9 @@ inline bool BSkipList::TryAppend(const KeyView& key) {
     return false;
   }
   if (count < kFanout) {
+    if (key.user_len > kInlineUserKey) {
+      EnsureExtra(leaf);
+    }
     BeginWrite(leaf);
     WriteSlot(leaf, count, key);
     leaf->count.store(count + 1, std::memory_order_relaxed);
@@ -1351,9 +1492,12 @@ inline void BSkipList::SplitAndInsert(Node* node, uint32_t rank,
 
   Node* right = node->next.load(std::memory_order_relaxed);
   neu->prev.store(node, std::memory_order_relaxed);
-  neu->next.store(right, std::memory_order_relaxed);
+  neu->next.store(right, std::memory_order_release);
   if (right != nullptr) {
     StoreNextHeader(neu, right);
+  }
+  if (key.user_len > kInlineUserKey) {
+    EnsureExtra(node);
   }
   BeginWrite(node);
   for (uint32_t i = 1; i < left_count; ++i) {
@@ -1364,7 +1508,7 @@ inline void BSkipList::SplitAndInsert(Node* node, uint32_t rank,
   }
   node->count.store(left_count, std::memory_order_relaxed);
   StoreNextHeader(node, neu);
-  node->next.store(neu, std::memory_order_relaxed);
+  node->next.store(neu, std::memory_order_release);
   EndWrite(node);
   if (right != nullptr) {
     BeginWrite(right);
@@ -1382,6 +1526,9 @@ inline void BSkipList::ShiftInsert(Node* node, uint32_t pos, const KeyView& key,
   assert(count < kFanout);
   assert(pos > 0);
   assert(pos <= count);
+  if (key.user_len > kInlineUserKey) {
+    EnsureExtra(node);
+  }
   BeginWrite(node);
   for (uint32_t i = count; i > pos; --i) {
     CopySlot(node, i, node, i - 1);
@@ -1487,6 +1634,7 @@ inline bool BSkipList::InsertConcurrently(const char* entry) {
 
 inline bool BSkipList::Descend(const KeyView& key, Node** leaf,
                                uint32_t* index, bool* equal) const {
+  uint32_t blocked = 0;
   for (;;) {
     const int top = height_.load(std::memory_order_acquire);
     const int start = top > 0 ? top - 1 : 0;
@@ -1496,10 +1644,15 @@ inline bool BSkipList::Descend(const KeyView& key, Node** leaf,
       for (;;) {
         const uint32_t seq1 = node->seq.load(std::memory_order_acquire);
         if (UNLIKELY((seq1 & 1u) != 0)) {
+          // A reader that only pauses will keep a preempted writer off-CPU.
           port::AsmVolatilePause();
+          if (++blocked > 100) {
+            std::this_thread::yield();
+          }
           failed = true;
           break;
         }
+        blocked = 0;
         Node* next = node->next.load(std::memory_order_relaxed);
         if (next != nullptr) {
           PREFETCH(next, 0, 3);
