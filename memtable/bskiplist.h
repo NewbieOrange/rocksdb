@@ -26,7 +26,10 @@
 //
 // The first 16 bytes of the user key and the footer live in the node. Keys
 // of that size, which is db_bench's default, are compared without touching
-// the memtable entry.
+// the memtable entry. Each node also keeps the first word of every slot in a
+// contiguous array, so the rank scan reads two cache lines instead of one
+// line per slot; the remaining fields stay packed as a slot payload so
+// shifting and splitting move one contiguous region.
 
 #pragma once
 
@@ -153,14 +156,15 @@ class BSkipList {
   };
 
   struct Slot {
-    // word0 is first: FindRank loads it for every occupied slot.
-    std::atomic<uint64_t> word0;
+    // word0 lives in a separate contiguous array on Node: FindRank scans it
+    // for every slot, so keeping those words together cuts a full node scan
+    // from ~10 cache lines to 2.
     std::atomic<uint64_t> word1;
     std::atomic<uint64_t> footer;
     std::atomic<uint32_t> user_len;
     std::atomic<const char*> entry;
 
-    Slot() : word0(0), word1(0), footer(0), user_len(0), entry(nullptr) {}
+    Slot() : word1(0), footer(0), user_len(0), entry(nullptr) {}
   };
 
   struct alignas(64) Node {
@@ -181,8 +185,10 @@ class BSkipList {
     std::atomic<uint64_t> next_footer;
     std::atomic<uint64_t> next_word0;
     std::atomic<uint64_t> next_word1;
-    // Slots start on a cache-line boundary. The first header line holds the
-    // seqlock, the child and next pointers, and the first slot's words.
+    // First word of every key, packed and byte-swapped. Contiguous so the
+    // rank scan reads two cache lines instead of one line per slot.
+    std::atomic<uint64_t> word0[kFanout];
+    // Remaining slot fields start on the next cache line.
     Slot slots[kFanout];
     std::atomic<uint64_t> next_extra[kExtraWords];
     // Only reverse iteration and splice fixup touch `prev`; keep it out of
@@ -201,6 +207,9 @@ class BSkipList {
           next_word0(0),
           next_word1(0),
           prev(nullptr) {
+      for (uint32_t i = 0; i < kFanout; ++i) {
+        word0[i].store(0, std::memory_order_relaxed);
+      }
       for (uint32_t i = 0; i < kExtraWords; ++i) {
         next_extra[i].store(0, std::memory_order_relaxed);
       }
@@ -209,8 +218,10 @@ class BSkipList {
 
   static_assert(sizeof(Node) % alignof(std::atomic<Node*>) == 0,
                 "children array must be aligned");
-  static_assert(offsetof(Node, slots) == 64,
-                "slots must start on the cache line after the seqlock");
+  static_assert(offsetof(Node, word0) == 64,
+                "word0 must start on the cache line after the seqlock");
+  static_assert(offsetof(Node, slots) == 64 + kFanout * sizeof(uint64_t),
+                "slots must follow the contiguous word0 array");
   static_assert(sizeof(Node) % 64 == 0,
                 "node size is a multiple of a cache line");
 
@@ -250,8 +261,8 @@ class BSkipList {
   void EnsureExtra(Node* node) const;
   void WriteSlot(Node* node, uint32_t index, const KeyView& key) const;
   void WriteSlot(Node* node, uint32_t index, const SlotView& src) const;
-  void CopySlot(Node* dst, uint32_t dst_index, const Node* src,
-                uint32_t src_index) const;
+  void CopySlots(Node* dst, uint32_t dst_index, const Node* src,
+                 uint32_t src_index, uint32_t n) const;
   SlotView ReadSlot(const Node* node, uint32_t index) const;
   int CompareFull(const char* a, uint32_t a_len, uint64_t a_foot, const char* b,
                   uint32_t b_len, uint64_t b_foot) const;
@@ -284,6 +295,7 @@ class BSkipList {
                              Node* new_child, Node* neu);
   void SplitAndInsertLocked(Node* node, uint32_t rank, const KeyView& key,
                             Node* new_child, Node* neu);
+  void ShiftSlotsRight(Node* node, uint32_t pos, uint32_t count);
   void ShiftInsertLocked(Node* node, uint32_t pos, const KeyView& key,
                          Node* child);
   bool TryAppendConcurrent(const KeyView& key);
@@ -463,10 +475,10 @@ inline BSkipList::Node* BSkipList::NewNode(uint32_t level) {
 }
 
 inline void BSkipList::WriteSentinel(Node* node) {
+  node->word0[0].store(0, std::memory_order_relaxed);
   node->slots[0].entry.store(nullptr, std::memory_order_relaxed);
   node->slots[0].footer.store(0, std::memory_order_relaxed);
   node->slots[0].user_len.store(0, std::memory_order_relaxed);
-  node->slots[0].word0.store(0, std::memory_order_relaxed);
   node->slots[0].word1.store(0, std::memory_order_relaxed);
   node->count.store(1, std::memory_order_relaxed);
 }
@@ -496,7 +508,7 @@ inline void BSkipList::WriteSlot(Node* node, uint32_t index,
   dst->entry.store(key.entry, std::memory_order_relaxed);
   dst->footer.store(key.footer, std::memory_order_relaxed);
   dst->user_len.store(key.user_len, std::memory_order_relaxed);
-  StoreUserWords(&dst->word0, &dst->word1, key.user, key.user_len);
+  StoreUserWords(&node->word0[index], &dst->word1, key.user, key.user_len);
   if (key.user_len <= kInlineUserKey &&
       node->extra.load(std::memory_order_relaxed) == nullptr) {
     return;
@@ -512,7 +524,7 @@ inline void BSkipList::WriteSlot(Node* node, uint32_t index,
 inline void BSkipList::WriteSlot(Node* node, uint32_t index,
                                  const SlotView& src) const {
   Slot* dst = &node->slots[index];
-  dst->word0.store(src.word0, std::memory_order_relaxed);
+  node->word0[index].store(src.word0, std::memory_order_relaxed);
   dst->word1.store(src.word1, std::memory_order_relaxed);
   dst->footer.store(src.footer, std::memory_order_relaxed);
   dst->user_len.store(src.user_len, std::memory_order_relaxed);
@@ -529,32 +541,48 @@ inline void BSkipList::WriteSlot(Node* node, uint32_t index,
   }
 }
 
-inline void BSkipList::CopySlot(Node* dst, uint32_t dst_index, const Node* src,
-                                uint32_t src_index) const {
-  const Slot& from = src->slots[src_index];
-  Slot* to = &dst->slots[dst_index];
-  to->entry.store(from.entry.load(std::memory_order_relaxed),
+inline void BSkipList::CopySlots(Node* dst, uint32_t dst_index, const Node* src,
+                                 uint32_t src_index, uint32_t n) const {
+  // Field-major copy of a contiguous slot range. Used by splits, where the
+  // source and destination ranges are both contiguous.
+  for (uint32_t i = 0; i < n; ++i) {
+    dst->word0[dst_index + i].store(
+        src->word0[src_index + i].load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+  }
+  for (uint32_t i = 0; i < n; ++i) {
+    Slot& d = dst->slots[dst_index + i];
+    const Slot& s = src->slots[src_index + i];
+    d.word1.store(s.word1.load(std::memory_order_relaxed),
                   std::memory_order_relaxed);
-  to->footer.store(from.footer.load(std::memory_order_relaxed),
+    d.footer.store(s.footer.load(std::memory_order_relaxed),
                    std::memory_order_relaxed);
-  to->user_len.store(from.user_len.load(std::memory_order_relaxed),
+    d.user_len.store(s.user_len.load(std::memory_order_relaxed),
                      std::memory_order_relaxed);
-  to->word0.store(from.word0.load(std::memory_order_relaxed),
+    d.entry.store(s.entry.load(std::memory_order_relaxed),
                   std::memory_order_relaxed);
-  to->word1.store(from.word1.load(std::memory_order_relaxed),
-                  std::memory_order_relaxed);
+  }
+  if (dst->level > 0) {
+    for (uint32_t i = 0; i < n; ++i) {
+      dst->children[dst_index + i].store(
+          src->children[src_index + i].load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
+    }
+  }
   const std::atomic<uint64_t>* src_extra =
       src->extra.load(std::memory_order_relaxed);
-  if (src_extra == nullptr) {
-    return;
-  }
-  EnsureExtra(dst);
-  const std::atomic<uint64_t>* from_row = src_extra + src_index * kExtraWords;
-  std::atomic<uint64_t>* to_row =
-      dst->extra.load(std::memory_order_relaxed) + dst_index * kExtraWords;
-  for (uint32_t t = 0; t < kExtraWords; ++t) {
-    to_row[t].store(from_row[t].load(std::memory_order_relaxed),
-                    std::memory_order_relaxed);
+  if (src_extra != nullptr) {
+    EnsureExtra(dst);
+    std::atomic<uint64_t>* dst_extra =
+        dst->extra.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i) {
+      for (uint32_t t = 0; t < kExtraWords; ++t) {
+        dst_extra[(dst_index + i) * kExtraWords + t].store(
+            src_extra[(src_index + i) * kExtraWords + t].load(
+                std::memory_order_relaxed),
+            std::memory_order_relaxed);
+      }
+    }
   }
 }
 
@@ -562,7 +590,7 @@ inline BSkipList::SlotView BSkipList::ReadSlot(const Node* node,
                                                uint32_t index) const {
   const Slot& src = node->slots[index];
   SlotView view;
-  view.word0 = src.word0.load(std::memory_order_relaxed);
+  view.word0 = node->word0[index].load(std::memory_order_relaxed);
   view.word1 = src.word1.load(std::memory_order_relaxed);
   view.footer = src.footer.load(std::memory_order_relaxed);
   view.user_len = src.user_len.load(std::memory_order_relaxed);
@@ -689,13 +717,15 @@ inline int BSkipList::CompareKeyToSlot(const KeyView& key,
 inline int BSkipList::CompareKeyToSlotAt(const KeyView& key, const Node* node,
                                          uint32_t index) const {
   const Slot& slot = node->slots[index];
-  if (slot.entry.load(std::memory_order_relaxed) == nullptr) {
-    return 1;
-  }
   const int c0 =
-      CmpPacked(key.word0, slot.word0.load(std::memory_order_relaxed));
+      CmpPacked(key.word0, node->word0[index].load(std::memory_order_relaxed));
   if (c0 != 0) {
     return c0;
+  }
+  // Only an occupied slot can match. Empty slots have word0 == 0, so a
+  // non-zero key word still returns above without touching this line.
+  if (slot.entry.load(std::memory_order_relaxed) == nullptr) {
+    return 1;
   }
   const int c1 =
       CmpPacked(key.word1, slot.word1.load(std::memory_order_relaxed));
@@ -791,7 +821,7 @@ inline void BSkipList::StoreNextHeader(Node* node, const Node* next_node) {
                             std::memory_order_relaxed);
   node->next_footer.store(slot0.footer.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
-  node->next_word0.store(slot0.word0.load(std::memory_order_relaxed),
+  node->next_word0.store(next_node->word0[0].load(std::memory_order_relaxed),
                          std::memory_order_relaxed);
   node->next_word1.store(slot0.word1.load(std::memory_order_relaxed),
                          std::memory_order_relaxed);
@@ -815,7 +845,7 @@ inline BSkipList::Rank BSkipList::FindRank(const Node* node, uint32_t count,
   uint32_t rank = 0;
   bool equal = false;
   for (uint32_t i = 1; i < count; ++i) {
-    const uint64_t sw0 = node->slots[i].word0.load(std::memory_order_relaxed);
+    const uint64_t sw0 = node->word0[i].load(std::memory_order_relaxed);
     if (UNLIKELY(kw0 == sw0)) {
       const uint64_t sw1 = node->slots[i].word1.load(std::memory_order_relaxed);
       if (kw1 < sw1) {
@@ -886,7 +916,7 @@ inline BSkipList::Rank BSkipList::FindRank(const Node* node, uint32_t count,
   // slot 0, so only an exact match needs the extra comparison.
   const Slot& head = node->slots[0];
   if (rank == 0 && head.entry.load(std::memory_order_relaxed) != nullptr &&
-      head.word0.load(std::memory_order_relaxed) == kw0) {
+      node->word0[0].load(std::memory_order_relaxed) == kw0) {
     equal = CompareKeyToSlotAt(key, node, 0) == 0;
   }
   return {rank, equal};
@@ -1112,13 +1142,7 @@ inline BSkipList::Node* BSkipList::PromotionSplitLocked(Node* node,
     neu->children[0].store(new_child, std::memory_order_relaxed);
   }
   const uint32_t move = count - (rank + 1);
-  for (uint32_t i = 0; i < move; ++i) {
-    CopySlot(neu, 1 + i, node, rank + 1 + i);
-    if (node->level > 0) {
-      Node* child = node->children[rank + 1 + i].load(std::memory_order_relaxed);
-      neu->children[1 + i].store(child, std::memory_order_relaxed);
-    }
-  }
+  CopySlots(neu, 1, node, rank + 1, move);
   neu->count.store(1 + move, std::memory_order_relaxed);
   SpliceLocked(node, neu, rank + 1);
   return neu;
@@ -1196,19 +1220,53 @@ inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
   }
 }
 
+inline void BSkipList::ShiftSlotsRight(Node* node, uint32_t pos,
+                                       uint32_t count) {
+  // Move slots [pos, count) one position right. Copy each field stream
+  // separately so the shift walks contiguous regions instead of alternating
+  // between them for every slot.
+  for (uint32_t i = count; i > pos; --i) {
+    node->word0[i].store(node->word0[i - 1].load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+  }
+  std::atomic<uint64_t>* extra = node->extra.load(std::memory_order_relaxed);
+  if (extra != nullptr) {
+    for (uint32_t i = count; i > pos; --i) {
+      for (uint32_t t = 0; t < kExtraWords; ++t) {
+        extra[i * kExtraWords + t].store(
+            extra[(i - 1) * kExtraWords + t].load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+      }
+    }
+  }
+  for (uint32_t i = count; i > pos; --i) {
+    Slot& dst = node->slots[i];
+    const Slot& src = node->slots[i - 1];
+    dst.word1.store(src.word1.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+    dst.footer.store(src.footer.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+    dst.user_len.store(src.user_len.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+    dst.entry.store(src.entry.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+  }
+  if (node->level > 0) {
+    for (uint32_t i = count; i > pos; --i) {
+      node->children[i].store(
+          node->children[i - 1].load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
+    }
+  }
+}
+
 inline void BSkipList::ShiftInsertLocked(Node* node, uint32_t pos,
                                          const KeyView& key, Node* child) {
   const uint32_t count = node->count.load(std::memory_order_relaxed);
   assert(count < kFanout);
   assert(pos > 0);
   assert(pos <= count);
-  for (uint32_t i = count; i > pos; --i) {
-    CopySlot(node, i, node, i - 1);
-    if (node->level > 0) {
-      Node* moved = node->children[i - 1].load(std::memory_order_relaxed);
-      node->children[i].store(moved, std::memory_order_relaxed);
-    }
-  }
+  ShiftSlotsRight(node, pos, count);
   WriteSlot(node, pos, key);
   if (node->level > 0) {
     node->children[pos].store(child, std::memory_order_relaxed);
@@ -1291,9 +1349,7 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
       const uint32_t moved = kFanout - half;
       Node* neu = spare;
       spare = nullptr;
-      for (uint32_t i = 0; i < moved; ++i) {
-        CopySlot(neu, i, leaf, half + i);
-      }
+      CopySlots(neu, 0, leaf, half, moved);
       WriteSlot(neu, moved, key);
       neu->count.store(moved + 1, std::memory_order_relaxed);
       SpliceLocked(leaf, neu, half);
@@ -1487,9 +1543,7 @@ inline bool BSkipList::TryAppend(const KeyView& key) {
   constexpr uint32_t half = kFanout / 2;
   Node* neu = NewNode(0);
   const uint32_t moved = kFanout - half;
-  for (uint32_t i = 0; i < moved; ++i) {
-    CopySlot(neu, i, leaf, half + i);
-  }
+  CopySlots(neu, 0, leaf, half, moved);
   WriteSlot(neu, moved, key);
   neu->count.store(moved + 1, std::memory_order_relaxed);
   SpliceAfter(leaf, neu, half);
@@ -1507,14 +1561,7 @@ inline BSkipList::Node* BSkipList::PromotionSplit(Node* node, uint32_t rank,
     neu->children[0].store(new_child, std::memory_order_relaxed);
   }
   const uint32_t move = count - (rank + 1);
-  for (uint32_t i = 0; i < move; ++i) {
-    CopySlot(neu, 1 + i, node, rank + 1 + i);
-    if (node->level > 0) {
-      Node* child =
-          node->children[rank + 1 + i].load(std::memory_order_relaxed);
-      neu->children[1 + i].store(child, std::memory_order_relaxed);
-    }
-  }
+  CopySlots(neu, 1, node, rank + 1, move);
   neu->count.store(1 + move, std::memory_order_relaxed);
   SpliceAfter(node, neu, rank + 1);
   return neu;
@@ -1609,13 +1656,7 @@ inline void BSkipList::ShiftInsert(Node* node, uint32_t pos, const KeyView& key,
     EnsureExtra(node);
   }
   BeginWrite(node);
-  for (uint32_t i = count; i > pos; --i) {
-    CopySlot(node, i, node, i - 1);
-    if (node->level > 0) {
-      Node* moved = node->children[i - 1].load(std::memory_order_relaxed);
-      node->children[i].store(moved, std::memory_order_relaxed);
-    }
-  }
+  ShiftSlotsRight(node, pos, count);
   WriteSlot(node, pos, key);
   if (node->level > 0) {
     node->children[pos].store(child, std::memory_order_relaxed);
