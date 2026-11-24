@@ -99,6 +99,10 @@ class BSkipListTest : public testing::Test {
 };
 
 TEST_F(BSkipListTest, Empty) {
+  // The header tower is not arena memory, so an empty list must not take the
+  // arena's first full block.
+  ASSERT_TRUE(arena_.IsInInlineBlock());
+  ASSERT_EQ(arena_.MemoryAllocatedBytes(), Arena::kInlineSize);
   BSkipList::Iterator iter(&list_);
   iter.SeekToFirst();
   ASSERT_FALSE(iter.Valid());

@@ -244,7 +244,26 @@ class BSkipList {
     bool equal;
   };
 
+  // Spelled as constants. A constexpr member function is not usable as an
+  // array bound while the class is still being defined.
+  static constexpr size_t kHeaderAlign = 64;
+  static constexpr size_t kLeafHeaderBytes =
+      (sizeof(Node) + kHeaderAlign - 1) & ~(kHeaderAlign - 1);
+  static constexpr size_t kInternalHeaderBytes =
+      (sizeof(Node) + sizeof(std::atomic<Node*>) * kFanout + kHeaderAlign - 1) &
+      ~(kHeaderAlign - 1);
+  static constexpr size_t kHeaderTowerBytes =
+      kLeafHeaderBytes +
+      static_cast<size_t>(kMaxHeight - 1) * kInternalHeaderBytes;
+
   Allocator* const allocator_;
+  // Header nodes live in the object, so an empty list does not allocate.
+  // Building them through the arena overflows its 2KB inline buffer and maps
+  // a full block (1MB at TiKV's arena_block_size) for every empty tablet.
+  // The tower has to exist at every level before height_ is published.
+  alignas(kHeaderAlign) char header_slab_[kHeaderTowerBytes];
+  static_assert(kHeaderTowerBytes <= 16 * 1024,
+                "header tower must stay a small part of the list object");
   Node* headers_[kMaxHeight];
   std::atomic<Node*> tail_;
   // Highest built level, in [1, kMaxHeight]. Readers start here so empty
@@ -265,6 +284,7 @@ class BSkipList {
   static int CmpPacked(uint64_t a, uint64_t b);
   static int CmpFooter(uint64_t a, uint64_t b);
 
+  Node* ConstructNode(char* placed, uint32_t level);
   Node* NewNode(uint32_t level);
   void WriteSentinel(Node* node);
   void EnsureExtra(Node* node) const;
@@ -466,15 +486,33 @@ inline int BSkipList::CmpFooter(uint64_t a, uint64_t b) {
   return 0;
 }
 
+inline BSkipList::Node* BSkipList::ConstructNode(char* placed, uint32_t level) {
+  Node* node = new (placed) Node(level);
+  if (level > 0) {
+    // Construct each pointer in place. Array placement-new is not portable:
+    // some standard libraries store a size cookie in front of the array.
+    void* raw = placed + sizeof(Node);
+    node->children = static_cast<std::atomic<Node*>*>(raw);
+    for (uint32_t i = 0; i < kFanout; ++i) {
+      new (node->children + i) std::atomic<Node*>(nullptr);
+    }
+  }
+  return node;
+}
+
 inline BSkipList::BSkipList(Allocator* allocator)
     : allocator_(allocator),
       headers_(),
       tail_(nullptr),
       height_(1),
       num_entries_(0) {
+  static_assert(alignof(BSkipList) >= kHeaderAlign,
+                "header tower must be 64-byte aligned");
+  char* cursor = header_slab_;
   for (int level = 0; level < kMaxHeight; ++level) {
-    headers_[level] = NewNode(static_cast<uint32_t>(level));
+    headers_[level] = ConstructNode(cursor, static_cast<uint32_t>(level));
     WriteSentinel(headers_[level]);
+    cursor += level == 0 ? kLeafHeaderBytes : kInternalHeaderBytes;
   }
   for (int level = 1; level < kMaxHeight; ++level) {
     headers_[level]->children[0].store(headers_[level - 1],
@@ -488,27 +526,14 @@ inline char* BSkipList::AllocateKey(size_t key_size) {
 }
 
 inline BSkipList::Node* BSkipList::NewNode(uint32_t level) {
-  size_t bytes = sizeof(Node);
-  if (level > 0) {
-    bytes += sizeof(std::atomic<Node*>) * kFanout;
-  }
   // Arena::AllocateAligned aligns to max_align_t. The seqlock and the cached
   // separator occupy the first 64 bytes only when the node itself is aligned.
   constexpr size_t kLine = 64;
+  const size_t bytes = level == 0 ? kLeafHeaderBytes : kInternalHeaderBytes;
   char* mem = allocator_->AllocateAligned(bytes + kLine - 1);
   const uintptr_t addr = reinterpret_cast<uintptr_t>(mem);
   char* placed = reinterpret_cast<char*>((addr + (kLine - 1)) & ~(kLine - 1));
-  Node* node = new (placed) Node(level);
-  if (level > 0) {
-    // Construct each pointer in place. Array placement-new is not portable:
-    // some standard libraries store a size cookie in front of the array.
-    void* raw = placed + sizeof(Node);
-    node->children = static_cast<std::atomic<Node*>*>(raw);
-    for (uint32_t i = 0; i < kFanout; ++i) {
-      new (node->children + i) std::atomic<Node*>(nullptr);
-    }
-  }
-  return node;
+  return ConstructNode(placed, level);
 }
 
 inline void BSkipList::WriteSentinel(Node* node) {
