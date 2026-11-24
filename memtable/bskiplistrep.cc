@@ -31,8 +31,8 @@ class BSkipListRep : public MemTableRep {
     return list_.Insert(static_cast<char*>(handle));
   }
 
-  bool InsertKeyWithHint(KeyHandle handle, void** /*hint*/) override {
-    return InsertKey(handle);
+  bool InsertKeyWithHint(KeyHandle handle, void** hint) override {
+    return list_.InsertWithHint(static_cast<char*>(handle), hint);
   }
 
   void InsertConcurrently(KeyHandle handle) override {
@@ -45,9 +45,8 @@ class BSkipListRep : public MemTableRep {
     return list_.InsertConcurrently(static_cast<char*>(handle));
   }
 
-  bool InsertKeyWithHintConcurrently(KeyHandle handle,
-                                     void** /*hint*/) override {
-    return InsertKeyConcurrently(handle);
+  bool InsertKeyWithHintConcurrently(KeyHandle handle, void** hint) override {
+    return list_.InsertWithHintConcurrently(static_cast<char*>(handle), hint);
   }
 
   bool Contains(const char* key) const override { return list_.Contains(key); }

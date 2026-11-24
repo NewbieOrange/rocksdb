@@ -83,6 +83,15 @@ class BSkipList {
   // InsertConcurrently must not run at the same time.
   bool InsertConcurrently(const char* key);
 
+  // `hint` is private to one writer. The first call allocates it. A later key
+  // that still belongs in the hinted leaf, or in one of the next few leaves,
+  // is inserted there instead of searching from the root. Sequential ranges
+  // that are not the list tail use this; the tail fast path does not.
+  // Single-writer hints are arena-allocated. Concurrent hints are `new
+  // char[]` so the memtable inserter can `delete[]` them.
+  bool InsertWithHint(const char* key, void** hint);
+  bool InsertWithHintConcurrently(const char* key, void** hint);
+
   bool Contains(const char* key) const;
 
   // `start_ikey` and `end_ikey` are internal keys (user key + footer), not
@@ -293,22 +302,50 @@ class BSkipList {
   // `neu` is allocated by the caller before the seqlock is taken.
   Node* PromotionSplitLocked(Node* node, uint32_t rank, const KeyView& key,
                              Node* new_child, Node* neu);
-  void SplitAndInsertLocked(Node* node, uint32_t rank, const KeyView& key,
-                            Node* new_child, Node* neu);
+  // Returns the node that holds `key` after the split.
+  Node* SplitAndInsertLocked(Node* node, uint32_t rank, const KeyView& key,
+                             Node* new_child, Node* neu);
   void ShiftSlotsRight(Node* node, uint32_t pos, uint32_t count);
   void ShiftInsertLocked(Node* node, uint32_t pos, const KeyView& key,
                          Node* child);
-  bool TryAppendConcurrent(const KeyView& key);
+  // `landed` receives the leaf that holds the new key. False means the tail
+  // path did not insert it (including a duplicate, which the slow path then
+  // rejects).
+  bool TryAppendConcurrent(const KeyView& key, Node** landed);
   // Null when `key` is already present at this level.
   Node* PromoteConcurrent(const KeyView& key, int level, Node* new_child);
-  bool InsertAtLevelConcurrent(const KeyView& key, int level, Node* child);
+  bool InsertAtLevelConcurrent(const KeyView& key, int level, Node* child,
+                               Node** landed);
   void PublishHeight(int height);
-  bool TryAppend(const KeyView& key);
+  enum class ApplyResult { kMiss, kInserted, kDuplicate };
+  struct InsertHint {
+    Node* leaf;
+  };
+  static constexpr uint32_t kSplitLeft = (kFanout + 1) / 2;
+  static constexpr uint32_t kSplitRight = kFanout + 1 - kSplitLeft;
+  InsertHint* PrepareHint(void** hint, bool on_heap);
+  Node* FollowHint(Node* start, const KeyView& key) const;
+  // Writes the right sibling only. True when `key` itself was written there.
+  bool FillSplitRight(Node* node, uint32_t pos, const KeyView& key,
+                      Node* new_child, Node* neu) const;
+  void PatchSplitLeft(Node* node, uint32_t pos, const KeyView& key,
+                      Node* new_child);
+  // Strict append into a non-full leaf. Kept separate so the common tail
+  // path stays a straight line; the split and in-leaf shift are heavier.
+  ApplyResult AppendInLeaf(Node* leaf, const KeyView& key, Node** landed);
+  ApplyResult InsertIntoLeaf(Node* leaf, const KeyView& key, Node** landed);
+  ApplyResult InsertIntoLeafConcurrent(Node* leaf, const KeyView& key,
+                                       Node** landed);
+  bool InsertPrepared(const KeyView& key, int height, Node** remember,
+                      bool try_tail = true);
+  bool InsertConcurrentPrepared(const KeyView& key, int height,
+                                Node** remember);
+  ApplyResult TryAppend(const KeyView& key, Node** landed);
   void SpliceAfter(Node* left, Node* neu, uint32_t new_left_count);
   Node* PromotionSplit(Node* node, uint32_t rank, const KeyView& key,
                        Node* new_child);
-  void SplitAndInsert(Node* node, uint32_t rank, const KeyView& key,
-                      Node* new_child);
+  Node* SplitAndInsert(Node* node, uint32_t rank, const KeyView& key,
+                       Node* new_child);
   void ShiftInsert(Node* node, uint32_t pos, const KeyView& key, Node* child);
   bool Descend(const KeyView& key, Node** leaf, uint32_t* index,
                bool* equal) const;
@@ -1148,69 +1185,64 @@ inline BSkipList::Node* BSkipList::PromotionSplitLocked(Node* node,
   return neu;
 }
 
-inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
-                                            const KeyView& key,
-                                            Node* new_child, Node* neu) {
+inline bool BSkipList::FillSplitRight(Node* node, uint32_t pos,
+                                      const KeyView& key, Node* new_child,
+                                      Node* neu) const {
+  // A full node plus one key is split in half. Copy the right half straight
+  // out of the source node. The inserted key is either the first slot of
+  // that half or a hole in the middle of it. The left node is not modified.
+  assert(node->count.load(std::memory_order_relaxed) == kFanout);
+  assert(pos > 0 && pos <= kFanout);
+  assert(neu != nullptr);
+  if (pos >= kSplitLeft) {
+    const uint32_t head = pos - kSplitLeft;
+    CopySlots(neu, 0, node, kSplitLeft, head);
+    WriteSlot(neu, head, key);
+    CopySlots(neu, head + 1, node, pos, kSplitRight - head - 1);
+    if (neu->level > 0) {
+      neu->children[head].store(new_child, std::memory_order_relaxed);
+    }
+  } else {
+    CopySlots(neu, 0, node, kSplitLeft - 1, kSplitRight);
+  }
+  neu->count.store(kSplitRight, std::memory_order_relaxed);
+  return pos >= kSplitLeft;
+}
+
+inline void BSkipList::PatchSplitLeft(Node* node, uint32_t pos,
+                                      const KeyView& key, Node* new_child) {
+  // The right sibling already holds the old slots from `kSplitLeft - 1` on.
+  // Shift only the left half, so slot `kSplitLeft` is not rewritten.
+  assert(pos > 0 && pos < kSplitLeft);
+  if (pos + 1 < kSplitLeft) {
+    ShiftSlotsRight(node, pos, kSplitLeft - 1);
+  }
+  WriteSlot(node, pos, key);
+  if (node->level > 0) {
+    node->children[pos].store(new_child, std::memory_order_relaxed);
+  }
+}
+
+inline BSkipList::Node* BSkipList::SplitAndInsertLocked(Node* node,
+                                                        uint32_t rank,
+                                                        const KeyView& key,
+                                                        Node* new_child,
+                                                        Node* neu) {
   const uint32_t count = node->count.load(std::memory_order_relaxed);
   assert(count == kFanout);
   assert(rank < count);
-  SlotView slots[kFanout + 1];
-  Node* kids[kFanout + 1];
-  for (uint32_t i = 0; i < count; ++i) {
-    slots[i] = ReadSlot(node, i);
-    if (node->level > 0) {
-      kids[i] = node->children[i].load(std::memory_order_relaxed);
-    }
-  }
   const uint32_t pos = rank + 1;
-  for (uint32_t i = count; i > pos; --i) {
-    slots[i] = slots[i - 1];
-    if (node->level > 0) {
-      kids[i] = kids[i - 1];
-    }
+  const bool on_right = FillSplitRight(node, pos, key, new_child, neu);
+  if (!on_right) {
+    PatchSplitLeft(node, pos, key, new_child);
   }
-  slots[pos].entry = key.entry;
-  slots[pos].user_len = key.user_len;
-  slots[pos].footer = key.footer;
-  slots[pos].word0 = key.word0;
-  slots[pos].word1 = key.word1;
-  for (uint32_t t = 0; t < kExtraWords; ++t) {
-    slots[pos].extra[t] = key.extra[t];
-  }
-  memset(slots[pos].user, 0, kInlineUserKey);
-  const uint32_t ncopy =
-      key.user_len < kInlineUserKey ? key.user_len : kInlineUserKey;
-  if (ncopy > 0) {
-    memcpy(slots[pos].user, key.user, ncopy);
-  }
-  if (node->level > 0) {
-    kids[pos] = new_child;
-  }
-  const uint32_t total = count + 1;
-  const uint32_t left_count = total / 2;
-  const uint32_t right_count = total - left_count;
-  assert(neu != nullptr);
-  for (uint32_t i = 0; i < right_count; ++i) {
-    WriteSlot(neu, i, slots[left_count + i]);
-    if (node->level > 0) {
-      neu->children[i].store(kids[left_count + i], std::memory_order_relaxed);
-    }
-  }
-  neu->count.store(right_count, std::memory_order_relaxed);
-
   Node* right = node->next.load(std::memory_order_relaxed);
   neu->prev.store(node, std::memory_order_relaxed);
   if (right != nullptr) {
     StoreNextHeader(neu, right);
   }
   neu->next.store(right, std::memory_order_release);
-  for (uint32_t i = 1; i < left_count; ++i) {
-    WriteSlot(node, i, slots[i]);
-    if (node->level > 0) {
-      node->children[i].store(kids[i], std::memory_order_relaxed);
-    }
-  }
-  node->count.store(left_count, std::memory_order_relaxed);
+  node->count.store(kSplitLeft, std::memory_order_relaxed);
   StoreNextHeader(node, neu);
   node->next.store(neu, std::memory_order_release);
   EndWrite(node);
@@ -1218,6 +1250,7 @@ inline void BSkipList::SplitAndInsertLocked(Node* node, uint32_t rank,
   if (right == nullptr) {
     PublishTail(neu);
   }
+  return on_right ? neu : node;
 }
 
 inline void BSkipList::ShiftSlotsRight(Node* node, uint32_t pos,
@@ -1275,7 +1308,7 @@ inline void BSkipList::ShiftInsertLocked(Node* node, uint32_t pos,
   EndWrite(node);
 }
 
-inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
+inline bool BSkipList::TryAppendConcurrent(const KeyView& key, Node** landed) {
   // One spare node, reused across attempts. Allocating it while the tail
   // seqlock is held is what stalls every other appender.
   Node* spare = nullptr;
@@ -1334,6 +1367,9 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
         WriteSlot(leaf, count, key);
         leaf->count.store(count + 1, std::memory_order_relaxed);
         EndWrite(leaf);
+        if (landed != nullptr) {
+          *landed = leaf;
+        }
         return true;
       }
       const bool copy_extra =
@@ -1353,6 +1389,9 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
       WriteSlot(neu, moved, key);
       neu->count.store(moved + 1, std::memory_order_relaxed);
       SpliceLocked(leaf, neu, half);
+      if (landed != nullptr) {
+        *landed = neu;
+      }
       return true;
     }
     // The key belongs inside the tail node. Shift locally instead of walking
@@ -1369,6 +1408,9 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
     }
     if (count < kFanout) {
       ShiftInsertLocked(leaf, found.index + 1, key, nullptr);
+      if (landed != nullptr) {
+        *landed = leaf;
+      }
       return true;
     }
     const bool copy_extra =
@@ -1380,7 +1422,10 @@ inline bool BSkipList::TryAppendConcurrent(const KeyView& key) {
       EndWrite(leaf);
       continue;
     }
-    SplitAndInsertLocked(leaf, found.index, key, nullptr, spare);
+    Node* dest = SplitAndInsertLocked(leaf, found.index, key, nullptr, spare);
+    if (landed != nullptr) {
+      *landed = dest;
+    }
     return true;
   }
   return false;
@@ -1427,7 +1472,7 @@ inline BSkipList::Node* BSkipList::PromoteConcurrent(const KeyView& key,
 }
 
 inline bool BSkipList::InsertAtLevelConcurrent(const KeyView& key, int level,
-                                               Node* child) {
+                                               Node* child, Node** landed) {
   Node* spare = nullptr;
   for (;;) {
     Node* node = Locate(key, level);
@@ -1474,9 +1519,15 @@ inline bool BSkipList::InsertAtLevelConcurrent(const KeyView& key, int level,
         }
         continue;
       }
-      SplitAndInsertLocked(node, found.index, key, child, spare);
+      Node* dest = SplitAndInsertLocked(node, found.index, key, child, spare);
+      if (landed != nullptr) {
+        *landed = dest;
+      }
     } else {
       ShiftInsertLocked(node, found.index + 1, key, child);
+      if (landed != nullptr) {
+        *landed = node;
+      }
     }
     return true;
   }
@@ -1516,38 +1567,163 @@ inline void BSkipList::SpliceAfter(Node* left, Node* neu,
   }
 }
 
-inline bool BSkipList::TryAppend(const KeyView& key) {
-  Node* leaf = tail_.load(std::memory_order_relaxed);
-  const uint32_t count = leaf->count.load(std::memory_order_relaxed);
-  if (count == 0 || count > kFanout) {
-    return false;
+inline BSkipList::InsertHint* BSkipList::PrepareHint(void** hint, bool on_heap) {
+  if (*hint != nullptr) {
+    return static_cast<InsertHint*>(*hint);
   }
-  if (CompareKeyToSlotAt(key, leaf, count - 1) <= 0) {
-    return false;
+  void* mem;
+  if (on_heap) {
+    mem = new char[sizeof(InsertHint)];
+  } else {
+    mem = allocator_->AllocateAligned(sizeof(InsertHint));
+  }
+  auto* created = new (mem) InsertHint();
+  created->leaf = nullptr;
+  *hint = mem;
+  return created;
+}
+
+inline BSkipList::Node* BSkipList::FollowHint(Node* start,
+                                              const KeyView& key) const {
+  Node* node = start;
+  // One extra leaf covers the split that moved the previous key. A longer
+  // walk makes a hint miss scan the tail on every random insert.
+  for (int step = 0; step < 2 && node != nullptr; ++step) {
+    if (node->level != 0) {
+      return nullptr;
+    }
+    const uint32_t count = node->count.load(std::memory_order_acquire);
+    if (count == 0 || count > kFanout) {
+      return nullptr;
+    }
+    if (CompareKeyToSlotAt(key, node, 0) < 0) {
+      return nullptr;
+    }
+    Node* next = node->next.load(std::memory_order_acquire);
+    if (next == nullptr || CompareKeyToNextHeader(key, node) < 0) {
+      return node;
+    }
+    node = next;
+  }
+  return nullptr;
+}
+
+__attribute__((always_inline)) inline BSkipList::ApplyResult
+BSkipList::AppendInLeaf(Node* leaf, const KeyView& key, Node** landed) {
+  if (leaf == nullptr || leaf->level != 0) {
+    return ApplyResult::kMiss;
+  }
+  const uint32_t count = leaf->count.load(std::memory_order_relaxed);
+  // A full leaf takes the split path. That is 1 in 16 appends.
+  if (count == 0 || count >= kFanout) {
+    return ApplyResult::kMiss;
+  }
+  const int cmp_last = CompareKeyToSlotAt(key, leaf, count - 1);
+  if (cmp_last == 0) {
+    return ApplyResult::kDuplicate;
+  }
+  if (cmp_last < 0) {
+    return ApplyResult::kMiss;
   }
   if (leaf->next.load(std::memory_order_relaxed) != nullptr &&
       CompareKeyToNextHeader(key, leaf) >= 0) {
-    return false;
+    return ApplyResult::kMiss;
+  }
+  if (key.user_len > kInlineUserKey) {
+    EnsureExtra(leaf);
+  }
+  BeginWrite(leaf);
+  WriteSlot(leaf, count, key);
+  leaf->count.store(count + 1, std::memory_order_relaxed);
+  EndWrite(leaf);
+  *landed = leaf;
+  return ApplyResult::kInserted;
+}
+
+__attribute__((noinline)) inline BSkipList::ApplyResult
+BSkipList::InsertIntoLeaf(Node* leaf,
+                                                        const KeyView& key,
+                                                        Node** landed) {
+  if (leaf == nullptr || leaf->level != 0) {
+    return ApplyResult::kMiss;
+  }
+  const uint32_t count = leaf->count.load(std::memory_order_relaxed);
+  if (count == 0 || count > kFanout) {
+    return ApplyResult::kMiss;
+  }
+  // One compare rejects a strict append's common case. Keys that sort inside
+  // this leaf still insert here; only an earlier leaf needs a tree walk.
+  const int cmp_last = CompareKeyToSlotAt(key, leaf, count - 1);
+  if (cmp_last == 0) {
+    return ApplyResult::kDuplicate;
+  }
+  if (leaf->next.load(std::memory_order_relaxed) != nullptr &&
+      CompareKeyToNextHeader(key, leaf) >= 0) {
+    return ApplyResult::kMiss;
+  }
+  if (cmp_last > 0) {
+    if (count < kFanout) {
+      if (key.user_len > kInlineUserKey) {
+        EnsureExtra(leaf);
+      }
+      BeginWrite(leaf);
+      WriteSlot(leaf, count, key);
+      leaf->count.store(count + 1, std::memory_order_relaxed);
+      EndWrite(leaf);
+      *landed = leaf;
+      return ApplyResult::kInserted;
+    }
+    constexpr uint32_t half = kFanout / 2;
+    Node* neu = NewNode(0);
+    const uint32_t moved = kFanout - half;
+    if (key.user_len > kInlineUserKey ||
+        leaf->extra.load(std::memory_order_acquire) != nullptr) {
+      EnsureExtra(neu);
+      if (key.user_len > kInlineUserKey) {
+        EnsureExtra(leaf);
+      }
+    }
+    CopySlots(neu, 0, leaf, half, moved);
+    WriteSlot(neu, moved, key);
+    neu->count.store(moved + 1, std::memory_order_relaxed);
+    SpliceAfter(leaf, neu, half);
+    *landed = neu;
+    return ApplyResult::kInserted;
+  }
+  if (CompareKeyToSlotAt(key, leaf, 0) < 0) {
+    return ApplyResult::kMiss;
+  }
+  const Rank found = FindRank(leaf, count, key);
+  if (found.equal) {
+    return ApplyResult::kDuplicate;
   }
   if (count < kFanout) {
-    if (key.user_len > kInlineUserKey) {
-      EnsureExtra(leaf);
-    }
-    BeginWrite(leaf);
-    WriteSlot(leaf, count, key);
-    leaf->count.store(count + 1, std::memory_order_relaxed);
-    EndWrite(leaf);
-    return true;
+    ShiftInsert(leaf, found.index + 1, key, nullptr);
+    *landed = leaf;
+    return ApplyResult::kInserted;
   }
+  *landed = SplitAndInsert(leaf, found.index, key, nullptr);
+  return ApplyResult::kInserted;
+}
 
-  constexpr uint32_t half = kFanout / 2;
-  Node* neu = NewNode(0);
-  const uint32_t moved = kFanout - half;
-  CopySlots(neu, 0, leaf, half, moved);
-  WriteSlot(neu, moved, key);
-  neu->count.store(moved + 1, std::memory_order_relaxed);
-  SpliceAfter(leaf, neu, half);
-  return true;
+__attribute__((always_inline)) inline BSkipList::ApplyResult
+BSkipList::TryAppend(const KeyView& key, Node** landed) {
+  Node* leaf = tail_.load(std::memory_order_relaxed);
+  const ApplyResult fast = AppendInLeaf(leaf, key, landed);
+  if (fast != ApplyResult::kMiss) {
+    return fast;
+  }
+  // The key is not a strict append. Insert it locally only when it still
+  // belongs in the tail; a key from an earlier leaf must not stop here.
+  if (leaf == nullptr || leaf->level != 0 ||
+      CompareKeyToSlotAt(key, leaf, 0) < 0) {
+    return ApplyResult::kMiss;
+  }
+  if (leaf->next.load(std::memory_order_relaxed) != nullptr &&
+      CompareKeyToNextHeader(key, leaf) >= 0) {
+    return ApplyResult::kMiss;
+  }
+  return InsertIntoLeaf(leaf, key, landed);
 }
 
 inline BSkipList::Node* BSkipList::PromotionSplit(Node* node, uint32_t rank,
@@ -1567,72 +1743,33 @@ inline BSkipList::Node* BSkipList::PromotionSplit(Node* node, uint32_t rank,
   return neu;
 }
 
-inline void BSkipList::SplitAndInsert(Node* node, uint32_t rank,
-                                      const KeyView& key, Node* new_child) {
+inline BSkipList::Node* BSkipList::SplitAndInsert(Node* node, uint32_t rank,
+                                                  const KeyView& key,
+                                                  Node* new_child) {
   const uint32_t count = node->count.load(std::memory_order_relaxed);
   assert(count == kFanout);
   assert(rank < count);
-  SlotView slots[kFanout + 1];
-  Node* kids[kFanout + 1];
-  for (uint32_t i = 0; i < count; ++i) {
-    slots[i] = ReadSlot(node, i);
-    if (node->level > 0) {
-      kids[i] = node->children[i].load(std::memory_order_relaxed);
-    }
-  }
   const uint32_t pos = rank + 1;
-  for (uint32_t i = count; i > pos; --i) {
-    slots[i] = slots[i - 1];
-    if (node->level > 0) {
-      kids[i] = kids[i - 1];
-    }
-  }
-  slots[pos].entry = key.entry;
-  slots[pos].user_len = key.user_len;
-  slots[pos].footer = key.footer;
-  slots[pos].word0 = key.word0;
-  slots[pos].word1 = key.word1;
-  for (uint32_t t = 0; t < kExtraWords; ++t) {
-    slots[pos].extra[t] = key.extra[t];
-  }
-  memset(slots[pos].user, 0, kInlineUserKey);
-  const uint32_t ncopy =
-      key.user_len < kInlineUserKey ? key.user_len : kInlineUserKey;
-  if (ncopy > 0) {
-    memcpy(slots[pos].user, key.user, ncopy);
-  }
-  if (node->level > 0) {
-    kids[pos] = new_child;
-  }
-  const uint32_t total = count + 1;
-  const uint32_t left_count = total / 2;
-  const uint32_t right_count = total - left_count;
   Node* neu = NewNode(node->level);
-  for (uint32_t i = 0; i < right_count; ++i) {
-    WriteSlot(neu, i, slots[left_count + i]);
-    if (node->level > 0) {
-      neu->children[i].store(kids[left_count + i], std::memory_order_relaxed);
+  if (key.user_len > kInlineUserKey ||
+      node->extra.load(std::memory_order_acquire) != nullptr) {
+    EnsureExtra(neu);
+    if (key.user_len > kInlineUserKey) {
+      EnsureExtra(node);
     }
   }
-  neu->count.store(right_count, std::memory_order_relaxed);
-
+  const bool on_right = FillSplitRight(node, pos, key, new_child, neu);
   Node* right = node->next.load(std::memory_order_relaxed);
   neu->prev.store(node, std::memory_order_relaxed);
   neu->next.store(right, std::memory_order_release);
   if (right != nullptr) {
     StoreNextHeader(neu, right);
   }
-  if (key.user_len > kInlineUserKey) {
-    EnsureExtra(node);
-  }
   BeginWrite(node);
-  for (uint32_t i = 1; i < left_count; ++i) {
-    WriteSlot(node, i, slots[i]);
-    if (node->level > 0) {
-      node->children[i].store(kids[i], std::memory_order_relaxed);
-    }
+  if (!on_right) {
+    PatchSplitLeft(node, pos, key, new_child);
   }
-  node->count.store(left_count, std::memory_order_relaxed);
+  node->count.store(kSplitLeft, std::memory_order_relaxed);
   StoreNextHeader(node, neu);
   node->next.store(neu, std::memory_order_release);
   EndWrite(node);
@@ -1644,6 +1781,7 @@ inline void BSkipList::SplitAndInsert(Node* node, uint32_t rank,
   if (right == nullptr && node->level == 0) {
     tail_.store(neu, std::memory_order_release);
   }
+  return on_right ? neu : node;
 }
 
 inline void BSkipList::ShiftInsert(Node* node, uint32_t pos, const KeyView& key,
@@ -1665,12 +1803,23 @@ inline void BSkipList::ShiftInsert(Node* node, uint32_t pos, const KeyView& key,
   EndWrite(node);
 }
 
-inline bool BSkipList::Insert(const char* entry) {
-  const KeyView key = ParseEntry(entry);
-  const int height = RandomHeight();
-  if (LIKELY(height == 0) && TryAppend(key)) {
-    num_entries_.fetch_add(1, std::memory_order_relaxed);
-    return true;
+__attribute__((noinline)) inline bool BSkipList::InsertPrepared(const KeyView& key,
+                                                            int height,
+                                                            Node** remember,
+                                                            bool try_tail) {
+  if (try_tail && LIKELY(height == 0)) {
+    Node* landed = nullptr;
+    const ApplyResult appended = TryAppend(key, &landed);
+    if (appended == ApplyResult::kInserted) {
+      if (remember != nullptr) {
+        *remember = landed;
+      }
+      num_entries_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    if (appended == ApplyResult::kDuplicate) {
+      return false;
+    }
   }
 
   Step path[kMaxHeight];
@@ -1693,6 +1842,9 @@ inline bool BSkipList::Insert(const char* entry) {
     const uint32_t count = curr->count.load(std::memory_order_relaxed);
     const Rank found = FindRank(curr, count, key);
     if (found.equal) {
+      if (remember != nullptr && level == 0) {
+        *remember = curr;
+      }
       return false;
     }
     path[level].node = curr;
@@ -1703,33 +1855,183 @@ inline bool BSkipList::Insert(const char* entry) {
     }
   }
 
+  Node* landed = nullptr;
   Node* below = nullptr;
   for (int level = 0; level < height; ++level) {
     below = PromotionSplit(path[level].node, path[level].rank, key, below);
+    if (level == 0) {
+      landed = below;
+    }
   }
-  Node* node = path[height].node;
-  const uint32_t rank = path[height].rank;
-  const uint32_t count = node->count.load(std::memory_order_relaxed);
-  if (count >= kFanout) {
-    SplitAndInsert(node, rank, key, below);
+  if (height == 0) {
+    Node* node = path[0].node;
+    const uint32_t rank = path[0].rank;
+    const uint32_t count = node->count.load(std::memory_order_relaxed);
+    if (count >= kFanout) {
+      landed = SplitAndInsert(node, rank, key, nullptr);
+    } else {
+      ShiftInsert(node, rank + 1, key, nullptr);
+      landed = node;
+    }
   } else {
-    ShiftInsert(node, rank + 1, key, below);
+    Node* node = path[height].node;
+    const uint32_t rank = path[height].rank;
+    const uint32_t count = node->count.load(std::memory_order_relaxed);
+    if (count >= kFanout) {
+      SplitAndInsert(node, rank, key, below);
+    } else {
+      ShiftInsert(node, rank + 1, key, below);
+    }
   }
   if (height + 1 > top) {
     height_.store(height + 1, std::memory_order_release);
   }
   num_entries_.fetch_add(1, std::memory_order_relaxed);
+  if (remember != nullptr) {
+    *remember = landed;
+  }
   return true;
 }
 
-inline bool BSkipList::InsertConcurrently(const char* entry) {
+inline bool BSkipList::Insert(const char* entry) {
   const KeyView key = ParseEntry(entry);
   const int height = RandomHeight();
-  if (LIKELY(height == 0) && TryAppendConcurrent(key)) {
-    num_entries_.fetch_add(1, std::memory_order_relaxed);
-    return true;
+  // The not-full strict append is the bulk of a sequential load. Keep it in
+  // this function so the search and split code stays off the hot path.
+  if (LIKELY(height == 0)) {
+    Node* landed = nullptr;
+    const ApplyResult fast = TryAppend(key, &landed);
+    if (fast == ApplyResult::kInserted) {
+      num_entries_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    if (fast == ApplyResult::kDuplicate) {
+      return false;
+    }
+  }
+  return InsertPrepared(key, height, nullptr, false);
+}
+
+inline BSkipList::ApplyResult BSkipList::InsertIntoLeafConcurrent(
+    Node* hint_leaf, const KeyView& key, Node** landed) {
+  Node* spare = nullptr;
+  Node* leaf = hint_leaf;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    leaf = FollowHint(leaf, key);
+    if (leaf == nullptr) {
+      return ApplyResult::kMiss;
+    }
+    const uint32_t observed = leaf->count.load(std::memory_order_acquire);
+    if (observed == 0 || observed > kFanout) {
+      return ApplyResult::kMiss;
+    }
+    const bool append = CompareKeyToSlotAt(key, leaf, observed - 1) > 0;
+    if (key.user_len > kInlineUserKey &&
+        leaf->extra.load(std::memory_order_acquire) == nullptr) {
+      EnsureExtra(leaf);
+    }
+    if (observed >= kFanout) {
+      const bool copy_extra =
+          key.user_len > kInlineUserKey ||
+          leaf->extra.load(std::memory_order_acquire) != nullptr;
+      if (spare == nullptr) {
+        spare = NewNode(0);
+      }
+      if (copy_extra &&
+          spare->extra.load(std::memory_order_acquire) == nullptr) {
+        EnsureExtra(spare);
+      }
+    }
+    if (!TryLockNode(leaf)) {
+      port::AsmVolatilePause();
+      continue;
+    }
+    const uint32_t count = leaf->count.load(std::memory_order_relaxed);
+    if (count == 0 || count > kFanout || !KeyBelongs(leaf, key)) {
+      EndWrite(leaf);
+      Node* next = leaf->next.load(std::memory_order_acquire);
+      leaf = next == nullptr ? hint_leaf : next;
+      continue;
+    }
+    if (append && CompareKeyToSlotAt(key, leaf, count - 1) > 0) {
+      if (count < kFanout) {
+        if (key.user_len > kInlineUserKey &&
+            leaf->extra.load(std::memory_order_relaxed) == nullptr) {
+          EndWrite(leaf);
+          continue;
+        }
+        WriteSlot(leaf, count, key);
+        leaf->count.store(count + 1, std::memory_order_relaxed);
+        EndWrite(leaf);
+        *landed = leaf;
+        return ApplyResult::kInserted;
+      }
+      const bool copy_extra =
+          key.user_len > kInlineUserKey ||
+          leaf->extra.load(std::memory_order_relaxed) != nullptr;
+      if (spare == nullptr ||
+          (copy_extra &&
+           spare->extra.load(std::memory_order_relaxed) == nullptr)) {
+        EndWrite(leaf);
+        continue;
+      }
+      constexpr uint32_t half = kFanout / 2;
+      const uint32_t moved = kFanout - half;
+      Node* neu = spare;
+      spare = nullptr;
+      CopySlots(neu, 0, leaf, half, moved);
+      WriteSlot(neu, moved, key);
+      neu->count.store(moved + 1, std::memory_order_relaxed);
+      SpliceLocked(leaf, neu, half);
+      *landed = neu;
+      return ApplyResult::kInserted;
+    }
+    if (key.user_len > kInlineUserKey &&
+        leaf->extra.load(std::memory_order_relaxed) == nullptr) {
+      EndWrite(leaf);
+      continue;
+    }
+    const Rank found = FindRank(leaf, count, key);
+    if (found.equal) {
+      EndWrite(leaf);
+      return ApplyResult::kDuplicate;
+    }
+    if (count < kFanout) {
+      ShiftInsertLocked(leaf, found.index + 1, key, nullptr);
+      *landed = leaf;
+      return ApplyResult::kInserted;
+    }
+    const bool copy_extra =
+        key.user_len > kInlineUserKey ||
+        leaf->extra.load(std::memory_order_relaxed) != nullptr;
+    if (spare == nullptr ||
+        (copy_extra &&
+         spare->extra.load(std::memory_order_relaxed) == nullptr)) {
+      EndWrite(leaf);
+      continue;
+    }
+    Node* neu = spare;
+    spare = nullptr;
+    *landed = SplitAndInsertLocked(leaf, found.index, key, nullptr, neu);
+    return ApplyResult::kInserted;
+  }
+  return ApplyResult::kMiss;
+}
+
+inline bool BSkipList::InsertConcurrentPrepared(const KeyView& key, int height,
+                                                Node** remember) {
+  if (LIKELY(height == 0)) {
+    Node* landed = nullptr;
+    if (TryAppendConcurrent(key, &landed)) {
+      if (remember != nullptr) {
+        *remember = landed;
+      }
+      num_entries_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
   }
 
+  Node* landed = nullptr;
   Node* below = nullptr;
   for (int level = 0; level < height; ++level) {
     Node* created = PromoteConcurrent(key, level, below);
@@ -1740,16 +2042,94 @@ inline bool BSkipList::InsertConcurrently(const char* entry) {
       // The key is already linked at a lower level.
       PublishHeight(height);
       num_entries_.fetch_add(1, std::memory_order_relaxed);
+      if (remember != nullptr && landed != nullptr) {
+        *remember = landed;
+      }
       return true;
+    }
+    if (level == 0) {
+      landed = created;
     }
     below = created;
   }
-  if (!InsertAtLevelConcurrent(key, height, below)) {
+  if (!InsertAtLevelConcurrent(key, height, below,
+                               height == 0 ? &landed : nullptr)) {
     return false;
   }
   PublishHeight(height);
   num_entries_.fetch_add(1, std::memory_order_relaxed);
+  if (remember != nullptr) {
+    *remember = landed;
+  }
   return true;
+}
+
+inline bool BSkipList::InsertConcurrently(const char* entry) {
+  return InsertConcurrentPrepared(ParseEntry(entry), RandomHeight(), nullptr);
+}
+
+inline bool BSkipList::InsertWithHint(const char* entry, void** hint) {
+  assert(hint != nullptr);
+  InsertHint* state = PrepareHint(hint, false);
+  const KeyView key = ParseEntry(entry);
+  const int height = RandomHeight();
+  if (height == 0 && state->leaf != nullptr) {
+    Node* landed = nullptr;
+    const ApplyResult fast = AppendInLeaf(state->leaf, key, &landed);
+    if (fast == ApplyResult::kInserted) {
+      state->leaf = landed;
+      num_entries_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    if (fast == ApplyResult::kDuplicate) {
+      return false;
+    }
+    Node* target = FollowHint(state->leaf, key);
+    if (target != nullptr) {
+      const ApplyResult rc = InsertIntoLeaf(target, key, &landed);
+      if (rc == ApplyResult::kInserted) {
+        state->leaf = landed;
+        num_entries_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+      }
+      if (rc == ApplyResult::kDuplicate) {
+        return false;
+      }
+    }
+  }
+  Node* landed = nullptr;
+  const bool ok = InsertPrepared(key, height, &landed);
+  if (landed != nullptr) {
+    state->leaf = landed;
+  }
+  return ok;
+}
+
+inline bool BSkipList::InsertWithHintConcurrently(const char* entry,
+                                                  void** hint) {
+  assert(hint != nullptr);
+  InsertHint* state = PrepareHint(hint, true);
+  const KeyView key = ParseEntry(entry);
+  const int height = RandomHeight();
+  if (height == 0 && state->leaf != nullptr) {
+    Node* landed = nullptr;
+    const ApplyResult rc =
+        InsertIntoLeafConcurrent(state->leaf, key, &landed);
+    if (rc == ApplyResult::kInserted) {
+      state->leaf = landed;
+      num_entries_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    if (rc == ApplyResult::kDuplicate) {
+      return false;
+    }
+  }
+  Node* landed = nullptr;
+  const bool ok = InsertConcurrentPrepared(key, height, &landed);
+  if (landed != nullptr) {
+    state->leaf = landed;
+  }
+  return ok;
 }
 
 inline bool BSkipList::Descend(const KeyView& key, Node** leaf,
